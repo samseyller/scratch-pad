@@ -69,6 +69,13 @@ enum LineEnding {
     CrLf,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum HighlightMode {
+    Off,
+    Syntax,
+    Markdown,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct AppSettings {
@@ -77,7 +84,7 @@ struct AppSettings {
     show_line_numbers: bool,
     recent_files: Vec<String>,
     word_wrap: bool,
-    syntax_highlighting: bool,
+    highlight_mode: HighlightMode,
     check_updates: bool,
     watch_file_changes: bool,
 }
@@ -90,7 +97,7 @@ impl Default for AppSettings {
             show_line_numbers: true,
             recent_files: Vec::new(),
             word_wrap: true,
-            syntax_highlighting: true,
+            highlight_mode: HighlightMode::Syntax,
             check_updates: true,
             watch_file_changes: true,
         }
@@ -593,23 +600,31 @@ impl ScratchpadApp {
         wrap: bool,
         wrap_width: f32,
         font_id: egui::FontId,
-        syntax_highlighting: bool,
+        highlight_mode: HighlightMode,
     ) -> impl FnMut(&egui::Ui, &str, f32) -> std::sync::Arc<egui::Galley> {
         move |ui, text, _wrap_width| {
             let max_width = if wrap { wrap_width } else { f32::INFINITY };
-            if syntax_highlighting {
-                let job =
-                    Self::build_syntax_highlight_job(text, &font_id, max_width, ui.visuals());
-                ui.fonts(|f| f.layout_job(job))
-            } else {
-                let mut job = egui::text::LayoutJob::simple(
-                    text.to_owned(),
-                    font_id.clone(),
-                    ui.visuals().text_color(),
-                    max_width,
-                );
-                job.wrap.max_width = max_width;
-                ui.fonts(|f| f.layout_job(job))
+            match highlight_mode {
+                HighlightMode::Markdown => {
+                    let job =
+                        Self::build_markdown_highlight_job(text, &font_id, max_width, ui.visuals());
+                    ui.fonts(|f| f.layout_job(job))
+                }
+                HighlightMode::Syntax => {
+                    let job =
+                        Self::build_syntax_highlight_job(text, &font_id, max_width, ui.visuals());
+                    ui.fonts(|f| f.layout_job(job))
+                }
+                HighlightMode::Off => {
+                    let mut job = egui::text::LayoutJob::simple(
+                        text.to_owned(),
+                        font_id.clone(),
+                        ui.visuals().text_color(),
+                        max_width,
+                    );
+                    job.wrap.max_width = max_width;
+                    ui.fonts(|f| f.layout_job(job))
+                }
             }
         }
     }
@@ -781,6 +796,156 @@ impl ScratchpadApp {
             let ch_len = ch.len_utf8();
             job.append(&text[idx..idx + ch_len], 0.0, normal.clone());
             idx += ch_len;
+        }
+
+        job
+    }
+
+    fn build_markdown_highlight_job(
+        text: &str,
+        font_id: &egui::FontId,
+        wrap_width: f32,
+        visuals: &egui::Visuals,
+    ) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = wrap_width;
+
+        let normal = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: visuals.text_color(),
+            ..Default::default()
+        };
+
+        let mut bold = normal.clone();
+        bold.extra_letter_spacing = 1.0;
+        bold.color = egui::Color32::from_rgb(235, 235, 235);
+        let mut italics = normal.clone();
+        let mut underline = normal.clone();
+        italics.italics = true;
+        underline.underline = egui::Stroke::new(1.0, underline.color);
+
+        let mut h1 = bold.clone();
+        h1.color = egui::Color32::from_rgb(160, 220, 160);
+        h1.underline = egui::Stroke::new(1.0, h1.color);
+
+        let mut h2 = bold.clone();
+        h2.color = egui::Color32::from_rgb(220, 200, 140);
+
+        let mut h3 = italics.clone();
+        h3.color = egui::Color32::from_rgb(120, 170, 255);
+
+        let mut code = normal.clone();
+        code.color = egui::Color32::from_rgb(140, 170, 210);
+
+        let mut in_code_fence = false;
+        for line in text.split_inclusive('\n') {
+            let trimmed = line.trim_start();
+            let is_fence = trimmed.starts_with("```");
+            if is_fence {
+                job.append(line, 0.0, code.clone());
+                in_code_fence = !in_code_fence;
+                continue;
+            }
+
+            if in_code_fence {
+                job.append(line, 0.0, code.clone());
+                continue;
+            }
+
+            let line_ends_with_newline = line.ends_with('\n');
+            let content = line.strip_suffix('\n').unwrap_or(line);
+            let trimmed_content = content.trim_start();
+
+            let heading_level = trimmed_content
+                .chars()
+                .take_while(|c| *c == '#')
+                .count();
+            if heading_level >= 1 && heading_level <= 3 {
+                let heading_text = trimmed_content
+                    .trim_start_matches('#')
+                    .trim_start();
+                let heading_format = match heading_level {
+                    1 => &h1,
+                    2 => &h2,
+                    _ => &h3,
+                };
+                job.append(heading_text, 0.0, heading_format.clone());
+                if line_ends_with_newline {
+                    job.append("\n", 0.0, normal.clone());
+                }
+                continue;
+            }
+
+            let mut idx = 0;
+            while idx < content.len() {
+                let rest = &content[idx..];
+
+                if rest.starts_with('`') {
+                    let end_rel = rest[1..].find('`').map(|p| p + 2);
+                    if let Some(end_rel) = end_rel {
+                        let end = idx + end_rel;
+                        let code_text = &content[idx + 1..end - 1];
+                        job.append("`", 0.0, code.clone());
+                        job.append(code_text, 0.0, code.clone());
+                        job.append("`", 0.0, code.clone());
+                        idx = end;
+                        continue;
+                    }
+                }
+
+                if rest.starts_with("**") {
+                    let end_rel = rest[2..].find("**").map(|p| p + 4);
+                    if let Some(end_rel) = end_rel {
+                        let end = idx + end_rel;
+                        let bold_text = &content[idx + 2..end - 2];
+                        job.append(bold_text, 0.0, bold.clone());
+                        idx = end;
+                        continue;
+                    }
+                }
+
+                if rest.starts_with("__") {
+                    let end_rel = rest[2..].find("__").map(|p| p + 4);
+                    if let Some(end_rel) = end_rel {
+                        let end = idx + end_rel;
+                        let underline_text = &content[idx + 2..end - 2];
+                        job.append(underline_text, 0.0, underline.clone());
+                        idx = end;
+                        continue;
+                    }
+                }
+
+                if rest.starts_with('*') {
+                    let end_rel = rest[1..].find('*').map(|p| p + 2);
+                    if let Some(end_rel) = end_rel {
+                        let end = idx + end_rel;
+                        let italic_text = &content[idx + 1..end - 1];
+                        job.append(italic_text, 0.0, italics.clone());
+                        idx = end;
+                        continue;
+                    }
+                }
+
+                if rest.starts_with('_') {
+                    let end_rel = rest[1..].find('_').map(|p| p + 2);
+                    if let Some(end_rel) = end_rel {
+                        let end = idx + end_rel;
+                        let italic_text = &content[idx + 1..end - 1];
+                        job.append(italic_text, 0.0, italics.clone());
+                        idx = end;
+                        continue;
+                    }
+                }
+
+                let ch = rest.chars().next().unwrap();
+                let ch_len = ch.len_utf8();
+                job.append(&content[idx..idx + ch_len], 0.0, normal.clone());
+                idx += ch_len;
+            }
+
+            if line_ends_with_newline {
+                job.append("\n", 0.0, normal.clone());
+            }
         }
 
         job
@@ -1074,6 +1239,7 @@ impl eframe::App for ScratchpadApp {
         let mut hotkey_open = false;
         let mut hotkey_save = false;
         let mut hotkey_save_as = false;
+        let mut hotkey_cycle_highlighting = false;
         let mut font_step = 0.0;
         ctx.input_mut(|i| {
             if i.consume_key(egui::Modifiers::COMMAND, egui::Key::N) {
@@ -1086,6 +1252,9 @@ impl eframe::App for ScratchpadApp {
                 hotkey_save_as = true;
             } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::S) {
                 hotkey_save = true;
+            }
+            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::H) {
+                hotkey_cycle_highlighting = true;
             }
             if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
                 || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
@@ -1105,6 +1274,13 @@ impl eframe::App for ScratchpadApp {
             self.do_save_as();
         } else if hotkey_save {
             self.do_save();
+        }
+        if hotkey_cycle_highlighting {
+            self.settings.highlight_mode = match self.settings.highlight_mode {
+                HighlightMode::Off => HighlightMode::Syntax,
+                HighlightMode::Syntax => HighlightMode::Markdown,
+                HighlightMode::Markdown => HighlightMode::Off,
+            };
         }
         if font_step != 0.0 {
             let updated = (self.settings.font_size + font_step)
@@ -1284,10 +1460,23 @@ impl eframe::App for ScratchpadApp {
                     changed |= ui
                         .checkbox(&mut self.settings.word_wrap, "Word wrap")
                         .changed();
+                    ui.separator();
+                    ui.label("Highlighting");
                     changed |= ui
-                        .checkbox(
-                            &mut self.settings.syntax_highlighting,
-                            "Syntax highlighting",
+                        .radio_value(&mut self.settings.highlight_mode, HighlightMode::Off, "Off")
+                        .changed();
+                    changed |= ui
+                        .radio_value(
+                            &mut self.settings.highlight_mode,
+                            HighlightMode::Syntax,
+                            "Syntax",
+                        )
+                        .changed();
+                    changed |= ui
+                        .radio_value(
+                            &mut self.settings.highlight_mode,
+                            HighlightMode::Markdown,
+                            "Markdown",
                         )
                         .changed();
                     if changed {
@@ -1641,7 +1830,7 @@ impl eframe::App for ScratchpadApp {
                             self.settings.word_wrap,
                             wrap_width,
                             font_id.clone(),
-                            self.settings.syntax_highlighting,
+                            self.settings.highlight_mode,
                         );
                         let text_edit = egui::TextEdit::multiline(&mut self.text)
                             .id(editor_id)
