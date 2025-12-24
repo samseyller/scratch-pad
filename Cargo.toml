@@ -2,6 +2,7 @@
 name = "scratchpad"
 version = "0.2.0"
 edition = "2024"
+license = "MIT"
 build = "build.rs"
 
 [dependencies]
@@ -13,5 +14,6 @@ ron = "0.8"
 arboard = "3"
 
 [build-dependencies]
+chrono = "0.4"
 ico = "0.3"
 winres = "0.1"

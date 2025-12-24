@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use chrono::Utc;
 
 fn main() {
     if std::env::var_os("CARGO_CFG_WINDOWS").is_none() {
@@ -7,6 +8,10 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=build.rs");
+    let build_time = Utc::now()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    println!("cargo:rustc-env=SCRATCHPAD_BUILD_TIME={}", build_time);
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR missing"));
     let icon_path = out_dir.join("scratchpad.ico");

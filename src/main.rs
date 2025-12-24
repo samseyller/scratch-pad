@@ -22,6 +22,7 @@ use ron::ser::PrettyConfig;
 /// - Some eframe/egui versions differ in API; this code avoids newer methods like
 ///   TextEdit::wrap(bool) and Frame::close().
 const APP_ID: &str = "Scratchpad";
+const BUILD_TIME: &str = env!("SCRATCHPAD_BUILD_TIME", "unknown");
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -170,6 +171,7 @@ struct ScratchpadApp {
 
     /// Find/replace panel state.
     find_state: FindState,
+    about_open: bool,
 }
 
 impl Default for ScratchpadApp {
@@ -185,6 +187,7 @@ impl Default for ScratchpadApp {
             last_error: None,
             settings: AppSettings::default(),
             find_state: FindState::default(),
+            about_open: false,
         }
     }
 }
@@ -942,6 +945,18 @@ impl eframe::App for ScratchpadApp {
                     }
                 });
 
+                ui.menu_button("Help", |ui| {
+                    if ui.button("Releases").clicked() {
+                        ui.close_menu();
+                        ctx.open_url(egui::OpenUrl::new_tab("https://github.com/samseyller/scratch-pad/releases"));
+                    }
+
+                    if ui.button("About").clicked() {
+                        ui.close_menu();
+                        self.about_open = true;
+                    }
+                });
+
                 // Right-side: show current full path (or Untitled)
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(path) = &self.file_path {
@@ -952,6 +967,47 @@ impl eframe::App for ScratchpadApp {
                 });
             });
         });
+
+        if self.about_open {
+            let about_width = 500.0;
+            egui::Window::new("About Scratchpad")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(about_width)
+                .min_width(about_width)
+                .max_width(about_width)
+                .open(&mut self.about_open)
+                .show(ctx, |ui| {
+                    let version = if cfg!(debug_assertions) {
+                        format!("Scratchpad v{} (dev)", env!("CARGO_PKG_VERSION"))
+                    } else {
+                        format!("Scratchpad v{}", env!("CARGO_PKG_VERSION"))
+                    };
+                    ui.label(version);
+                    ui.label(format!("Build time: {}", BUILD_TIME));
+                    ui.add_space(8.0);
+                    ui.label("MIT License");
+                    ui.separator();
+                    let license_size = 12.0;
+                    ui.label(egui::RichText::new("Permission is hereby granted, free of charge, to any person obtaining a copy ").size(license_size));
+                    ui.label(egui::RichText::new(r#"of this software and associated documentation files (the "Software"), to deal"#).size(license_size));
+                    ui.label(egui::RichText::new("in the Software without restriction, including without limitation the rights").size(license_size));
+                    ui.label(egui::RichText::new("to use, copy, modify, merge, publish, distribute, sublicense, and/or sell").size(license_size));
+                    ui.label(egui::RichText::new("copies of the Software, and to permit persons to whom the Software is").size(license_size));
+                    ui.label(egui::RichText::new("furnished to do so, subject to the following conditions:").size(license_size));
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("The above copyright notice and this permission notice shall be included in all").size(license_size));
+                    ui.label(egui::RichText::new("copies or substantial portions of the Software.").size(license_size));
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(r#"THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR"#).size(license_size));
+                    ui.label(egui::RichText::new("IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,").size(license_size));
+                    ui.label(egui::RichText::new("FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE").size(license_size));
+                    ui.label(egui::RichText::new("AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER").size(license_size));
+                    ui.label(egui::RichText::new("LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,").size(license_size));
+                    ui.label(egui::RichText::new("OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE").size(license_size));
+                    ui.label(egui::RichText::new("SOFTWARE.").size(license_size));
+                });
+        }
 
         if self.find_state.open {
             let mut find_open = self.find_state.open;
