@@ -27,10 +27,12 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
+
     eframe::run_native(
         "Scratchpad",
         native_options,
-        Box::new(|cc| Box::new(ScratchpadApp::new(cc))),
+        Box::new(move |cc| Box::new(ScratchpadApp::new(cc, initial_path.clone()))),
     )
 }
 
@@ -178,12 +180,15 @@ impl Default for ScratchpadApp {
 }
 
 impl ScratchpadApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
         let mut app = Self::default();
         if let Some(storage) = cc.storage {
             if let Some(settings) = eframe::get_value(storage, "scratchpad_settings") {
                 app.settings = settings;
             }
+        }
+        if let Some(path) = initial_path {
+            app.do_open_path(path);
         }
         app
     }
