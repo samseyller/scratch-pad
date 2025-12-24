@@ -885,7 +885,10 @@ impl eframe::App for ScratchpadApp {
 
                     ui.label("Font size");
                     changed |= ui
-                        .add(egui::Slider::new(&mut self.settings.font_size, 10.0..=24.0))
+                        .add(
+                            egui::Slider::new(&mut self.settings.font_size, 10.0..=24.0)
+                                .step_by(0.5),
+                        )
                         .changed();
 
                     ui.separator();
