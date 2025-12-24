@@ -1258,17 +1258,6 @@ impl eframe::App for ScratchpadApp {
                             "Syntax highlighting",
                         )
                         .changed();
-                    let watch_changed = ui
-                        .checkbox(&mut self.settings.watch_file_changes, "File monitoring")
-                        .changed();
-                    changed |= watch_changed;
-                    if watch_changed {
-                        self.file_change_disabled = !self.settings.watch_file_changes;
-                        if self.settings.watch_file_changes {
-                            self.last_file_mtime = Self::read_file_mtime(&self.file_path);
-                        }
-                    }
-
                     if changed {
                         self.apply_font_settings(ctx);
                     }
