@@ -724,6 +724,11 @@ impl eframe::App for ScratchpadApp {
             self.find_state.open = true;
             self.find_state.show_replace = true;
         }
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested && self.is_dirty() {
+            self.pending_action = Some(PendingAction::Exit);
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         // ─────────────────────────────────────────────────────────────────────
         // Top menu bar
         // ─────────────────────────────────────────────────────────────────────
