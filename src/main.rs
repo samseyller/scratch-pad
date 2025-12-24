@@ -67,6 +67,7 @@ struct AppSettings {
     font_family: FontFamilySetting,
     show_line_numbers: bool,
     recent_files: Vec<String>,
+    word_wrap: bool,
 }
 
 impl Default for AppSettings {
@@ -76,6 +77,7 @@ impl Default for AppSettings {
             font_family: FontFamilySetting::Monospace,
             show_line_numbers: true,
             recent_files: Vec::new(),
+            word_wrap: true,
         }
     }
 }
@@ -456,6 +458,24 @@ impl ScratchpadApp {
             font_id.size = 14.0;
         }
         ctx.set_style(style);
+    }
+
+    fn make_editor_layouter(
+        wrap: bool,
+        wrap_width: f32,
+        font_id: egui::FontId,
+    ) -> impl FnMut(&egui::Ui, &str, f32) -> std::sync::Arc<egui::Galley> {
+        move |ui, text, _wrap_width| {
+            let max_width = if wrap { wrap_width } else { f32::INFINITY };
+            let mut job = egui::text::LayoutJob::simple(
+                text.to_owned(),
+                font_id.clone(),
+                ui.visuals().text_color(),
+                max_width,
+            );
+            job.wrap.max_width = max_width;
+            ui.fonts(|f| f.layout_job(job))
+        }
     }
 
     fn set_find_result(&mut self, msg: impl Into<String>) {
@@ -912,6 +932,9 @@ impl eframe::App for ScratchpadApp {
                     changed |= ui
                         .checkbox(&mut self.settings.show_line_numbers, "Line numbers")
                         .changed();
+                    changed |= ui
+                        .checkbox(&mut self.settings.word_wrap, "Word wrap")
+                        .changed();
 
                     if changed {
                         self.apply_font_settings(ctx);
@@ -1057,7 +1080,12 @@ impl eframe::App for ScratchpadApp {
                 Vec::new()
             };
 
-            let response = egui::ScrollArea::vertical()
+            let scroll_area = if self.settings.word_wrap {
+                egui::ScrollArea::vertical()
+            } else {
+                egui::ScrollArea::both()
+            };
+            let response = scroll_area
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let available_width = ui.available_width();
@@ -1084,7 +1112,11 @@ impl eframe::App for ScratchpadApp {
 
                     let text_margin_x = 4.0;
                     let line_number_offset_y = -8.0;
-                    let wrap_width = (text_width - 2.0 * text_margin_x).max(1.0);
+                    let wrap_width = if self.settings.word_wrap {
+                        (text_width - 2.0 * text_margin_x).max(1.0)
+                    } else {
+                        f32::INFINITY
+                    };
 
                     ui.horizontal(|ui| {
                         if show_line_numbers {
@@ -1136,10 +1168,16 @@ impl eframe::App for ScratchpadApp {
                             );
                         }
 
-            let text_edit = egui::TextEdit::multiline(&mut self.text)
-                .id(editor_id)
-                .font(font_id.clone())
-                .desired_width(text_width);
+                        let mut layouter = Self::make_editor_layouter(
+                            self.settings.word_wrap,
+                            wrap_width,
+                            font_id.clone(),
+                        );
+                        let text_edit = egui::TextEdit::multiline(&mut self.text)
+                            .id(editor_id)
+                            .font(font_id.clone())
+                            .layouter(&mut layouter)
+                            .desired_width(text_width);
 
                         let output = ui
                             .allocate_ui_with_layout(
