@@ -349,6 +349,10 @@ impl ScratchpadApp {
         }
     }
 
+    fn handle_command(&mut self, command: PendingAction) {
+        self.maybe_defer_or_run(command);
+    }
+
     /// If there are unsaved changes, defer the action and show the modal.
     /// Otherwise run the action immediately.
     fn maybe_defer_or_run(&mut self, action: PendingAction) {
@@ -724,6 +728,22 @@ impl eframe::App for ScratchpadApp {
             self.find_state.open = true;
             self.find_state.show_replace = true;
         }
+        let mut hotkey_new = false;
+        let mut hotkey_open = false;
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::N) {
+                hotkey_new = true;
+            }
+            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::O) {
+                hotkey_open = true;
+            }
+        });
+        if hotkey_new {
+            self.handle_command(PendingAction::NewFile);
+        }
+        if hotkey_open {
+            self.handle_command(PendingAction::OpenFile);
+        }
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if close_requested && self.is_dirty() {
             self.pending_action = Some(PendingAction::Exit);
@@ -735,9 +755,9 @@ impl eframe::App for ScratchpadApp {
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("New").clicked() {
+                    if ui.button("New (Ctrl+N)").clicked() {
                         ui.close_menu();
-                        self.maybe_defer_or_run(PendingAction::NewFile);
+                        self.handle_command(PendingAction::NewFile);
                     }
 
                     if ui.button("Open…").clicked() {
