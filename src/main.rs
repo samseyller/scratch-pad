@@ -1105,7 +1105,8 @@ impl eframe::App for ScratchpadApp {
                                         ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new((idx + 1).to_string())
-                                                    .color(line_number_color),
+                                                    .color(line_number_color)
+                                                    .font(font_id.clone()),
                                             )
                                             .wrap(false),
                                         );
