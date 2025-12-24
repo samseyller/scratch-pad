@@ -639,7 +639,9 @@ impl ScratchpadApp {
                 | "false"
                 | "fn"
                 | "for"
+                | "from"
                 | "if"
+                | "import"
                 | "impl"
                 | "in"
                 | "let"
@@ -648,6 +650,7 @@ impl ScratchpadApp {
                 | "mod"
                 | "move"
                 | "mut"
+                | "pass"
                 | "pub"
                 | "ref"
                 | "return"
@@ -657,12 +660,16 @@ impl ScratchpadApp {
                 | "struct"
                 | "super"
                 | "trait"
+                | "try"
+                | "except"
+                | "finally"
                 | "true"
                 | "type"
                 | "unsafe"
                 | "use"
                 | "where"
                 | "while"
+                | "def"
         )
     }
 
@@ -704,7 +711,7 @@ impl ScratchpadApp {
         let mut idx = 0;
         while idx < text.len() {
             let rest = &text[idx..];
-            if rest.starts_with("//") {
+            if rest.starts_with("//") || rest.starts_with('#') {
                 let end = rest.find('\n').map(|p| idx + p).unwrap_or(text.len());
                 job.append(&text[idx..end], 0.0, comment.clone());
                 idx = end;
