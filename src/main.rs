@@ -66,6 +66,7 @@ struct AppSettings {
     font_size: f32,
     font_family: FontFamilySetting,
     show_line_numbers: bool,
+    recent_files: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -74,6 +75,7 @@ impl Default for AppSettings {
             font_size: 16.0,
             font_family: FontFamilySetting::Monospace,
             show_line_numbers: true,
+            recent_files: Vec::new(),
         }
     }
 }
@@ -257,6 +259,7 @@ impl ScratchpadApp {
                 self.text = normalized;
                 self.saved_snapshot = self.text.clone();
                 self.line_ending = line_ending;
+                self.push_recent(&path);
                 self.file_path = Some(path);
                 self.request_editor_focus = true;
                 self.reset_editor_state = true;
@@ -275,6 +278,7 @@ impl ScratchpadApp {
                 self.text = normalized;
                 self.saved_snapshot = self.text.clone();
                 self.line_ending = line_ending;
+                self.push_recent(&path);
                 self.file_path = Some(path);
                 self.request_editor_focus = true;
                 self.reset_editor_state = true;
@@ -351,6 +355,15 @@ impl ScratchpadApp {
 
     fn handle_command(&mut self, command: PendingAction) {
         self.maybe_defer_or_run(command);
+    }
+
+    fn push_recent(&mut self, path: &Path) {
+        let path_str = path.to_string_lossy().to_string();
+        self.settings.recent_files.retain(|p| p != &path_str);
+        self.settings.recent_files.insert(0, path_str);
+        if self.settings.recent_files.len() > 10 {
+            self.settings.recent_files.truncate(10);
+        }
     }
 
     /// If there are unsaved changes, defer the action and show the modal.
@@ -760,10 +773,45 @@ impl eframe::App for ScratchpadApp {
                         self.handle_command(PendingAction::NewFile);
                     }
 
-                    if ui.button("Open…").clicked() {
+                    if ui.button("Open... (Ctrl+O)").clicked() {
                         ui.close_menu();
-                        self.maybe_defer_or_run(PendingAction::OpenFile);
+                        self.handle_command(PendingAction::OpenFile);
                     }
+
+                    ui.menu_button("Recent", |ui| {
+                        let mut to_open: Option<PathBuf> = None;
+                        let mut remove_entry: Option<String> = None;
+                        let recent = self.settings.recent_files.clone();
+
+                        if recent.is_empty() {
+                            ui.label("No recent files");
+                        } else {
+                            for entry in recent.into_iter().take(10) {
+                                if ui.button(entry.as_str()).clicked() {
+                                    ui.close_menu();
+                                    let path = PathBuf::from(&entry);
+                                    if path.exists() {
+                                        to_open = Some(path);
+                                    } else {
+                                        remove_entry = Some(entry);
+                                        self.set_error("Recent file missing; removed from list.");
+                                    }
+                                }
+                            }
+                        }
+
+                        ui.separator();
+                        if ui.button("Clear recent files").clicked() {
+                            self.settings.recent_files.clear();
+                        }
+
+                        if let Some(entry) = remove_entry {
+                            self.settings.recent_files.retain(|p| p != &entry);
+                        }
+                        if let Some(path) = to_open {
+                            self.handle_command(PendingAction::OpenPath(path));
+                        }
+                    });
 
                     ui.separator();
 
