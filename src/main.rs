@@ -1072,6 +1072,9 @@ impl eframe::App for ScratchpadApp {
         self.check_external_change();
         let mut hotkey_new = false;
         let mut hotkey_open = false;
+        let mut hotkey_save = false;
+        let mut hotkey_save_as = false;
+        let mut font_step = 0.0;
         ctx.input_mut(|i| {
             if i.consume_key(egui::Modifiers::COMMAND, egui::Key::N) {
                 hotkey_new = true;
@@ -1079,12 +1082,34 @@ impl eframe::App for ScratchpadApp {
             if i.consume_key(egui::Modifiers::COMMAND, egui::Key::O) {
                 hotkey_open = true;
             }
+            if i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S) {
+                hotkey_save_as = true;
+            } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::S) {
+                hotkey_save = true;
+            }
+            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
+                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
+            {
+                font_step = 0.5;
+            } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus) {
+                font_step = -0.5;
+            }
         });
         if hotkey_new {
             self.handle_command(PendingAction::NewFile);
         }
         if hotkey_open {
             self.handle_command(PendingAction::OpenFile);
+        }
+        if hotkey_save_as {
+            self.do_save_as();
+        } else if hotkey_save {
+            self.do_save();
+        }
+        if font_step != 0.0 {
+            let updated = (self.settings.font_size + font_step)
+                .clamp(10.0, 24.0);
+            self.settings.font_size = (updated * 2.0).round() / 2.0;
         }
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if close_requested && self.is_dirty() {
@@ -1147,7 +1172,7 @@ impl eframe::App for ScratchpadApp {
                     // Enable save if dirty, or if the file has no path yet (so it can be saved).
                     let save_enabled = self.is_dirty() || self.file_path.is_none();
                     if ui
-                        .add_enabled(save_enabled, egui::Button::new("Save"))
+                        .add_enabled(save_enabled, egui::Button::new("Save (Ctrl+S)"))
                         .clicked()
                     {
                         ui.close_menu();
