@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
@@ -77,6 +78,7 @@ struct AppSettings {
     recent_files: Vec<String>,
     word_wrap: bool,
     check_updates: bool,
+    watch_file_changes: bool,
 }
 
 impl Default for AppSettings {
@@ -88,6 +90,7 @@ impl Default for AppSettings {
             recent_files: Vec::new(),
             word_wrap: true,
             check_updates: true,
+            watch_file_changes: true,
         }
     }
 }
@@ -160,6 +163,9 @@ struct ScratchpadApp {
     /// Original line-ending style of the file on disk.
     line_ending: LineEnding,
 
+    /// Last known modified timestamp for the opened file.
+    last_file_mtime: Option<SystemTime>,
+
     /// If set, show the "Unsaved changes" dialog and then run this action.
     pending_action: Option<PendingAction>,
 
@@ -183,6 +189,9 @@ struct ScratchpadApp {
     update_available_url: Option<String>,
     update_check_in_flight: bool,
     update_rx: Option<Receiver<UpdateCheckResult>>,
+
+    file_change_prompt_open: bool,
+    file_change_disabled: bool,
 }
 
 impl Default for ScratchpadApp {
@@ -192,6 +201,7 @@ impl Default for ScratchpadApp {
             file_path: None,
             saved_snapshot: String::new(),
             line_ending: LineEnding::Lf,
+            last_file_mtime: None,
             pending_action: None,
             request_editor_focus: true,
             reset_editor_state: false,
@@ -203,6 +213,8 @@ impl Default for ScratchpadApp {
             update_available_url: None,
             update_check_in_flight: false,
             update_rx: None,
+            file_change_prompt_open: false,
+            file_change_disabled: false,
         }
     }
 }
@@ -258,6 +270,7 @@ impl ScratchpadApp {
         self.saved_snapshot.clear();
         self.file_path = None;
         self.line_ending = LineEnding::Lf;
+        self.last_file_mtime = None;
         self.clear_error();
         self.request_editor_focus = true;
         self.reset_editor_state = true;
@@ -285,6 +298,7 @@ impl ScratchpadApp {
                 self.line_ending = line_ending;
                 self.push_recent(&path);
                 self.file_path = Some(path);
+                self.last_file_mtime = Self::read_file_mtime(&self.file_path);
                 self.request_editor_focus = true;
                 self.reset_editor_state = true;
             }
@@ -304,6 +318,7 @@ impl ScratchpadApp {
                 self.line_ending = line_ending;
                 self.push_recent(&path);
                 self.file_path = Some(path);
+                self.last_file_mtime = Self::read_file_mtime(&self.file_path);
                 self.request_editor_focus = true;
                 self.reset_editor_state = true;
             }
@@ -338,6 +353,7 @@ impl ScratchpadApp {
 
         // Only mark "clean" after a successful write.
         self.saved_snapshot = self.text.clone();
+        self.last_file_mtime = Self::read_file_mtime(&self.file_path);
     }
 
     /// Save As: pick a file path, then save there.
@@ -363,6 +379,7 @@ impl ScratchpadApp {
 
         self.file_path = Some(path);
         self.saved_snapshot = self.text.clone();
+        self.last_file_mtime = Self::read_file_mtime(&self.file_path);
     }
 
     /// Suggest a filename in the Save As dialog.
@@ -379,6 +396,51 @@ impl ScratchpadApp {
 
     fn handle_command(&mut self, command: PendingAction) {
         self.maybe_defer_or_run(command);
+    }
+
+    fn read_file_mtime(path: &Option<PathBuf>) -> Option<SystemTime> {
+        let path = path.as_ref()?;
+        fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
+
+    fn check_external_change(&mut self) {
+        if self.file_change_disabled || !self.settings.watch_file_changes {
+            return;
+        }
+        let Some(path) = &self.file_path else {
+            return;
+        };
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        let Ok(modified) = metadata.modified() else {
+            return;
+        };
+        if let Some(last) = self.last_file_mtime {
+            if modified > last {
+                self.file_change_prompt_open = true;
+            }
+        } else {
+            self.last_file_mtime = Some(modified);
+        }
+    }
+
+    fn reload_from_disk(&mut self) {
+        let Some(path) = &self.file_path else {
+            return;
+        };
+        match fs::read_to_string(path) {
+            Ok(contents) => {
+                let (normalized, line_ending) = Self::normalize_line_endings(&contents);
+                self.text = normalized;
+                self.saved_snapshot = self.text.clone();
+                self.line_ending = line_ending;
+                self.last_file_mtime = Self::read_file_mtime(&self.file_path);
+                self.request_editor_focus = true;
+                self.reset_editor_state = true;
+            }
+            Err(e) => self.set_error(format!("Failed to reload file: {e}")),
+        }
     }
 
     fn start_update_check(&mut self, ctx: egui::Context) {
@@ -826,6 +888,7 @@ impl eframe::App for ScratchpadApp {
             self.find_state.open = true;
             self.find_state.show_replace = true;
         }
+        self.check_external_change();
         let mut hotkey_new = false;
         let mut hotkey_open = false;
         ctx.input_mut(|i| {
@@ -1001,6 +1064,16 @@ impl eframe::App for ScratchpadApp {
                     changed |= ui
                         .checkbox(&mut self.settings.word_wrap, "Word wrap")
                         .changed();
+                    let watch_changed = ui
+                        .checkbox(&mut self.settings.watch_file_changes, "File monitoring")
+                        .changed();
+                    changed |= watch_changed;
+                    if watch_changed {
+                        self.file_change_disabled = !self.settings.watch_file_changes;
+                        if self.settings.watch_file_changes {
+                            self.last_file_mtime = Self::read_file_mtime(&self.file_path);
+                        }
+                    }
 
                     if changed {
                         self.apply_font_settings(ctx);
@@ -1089,6 +1162,48 @@ impl eframe::App for ScratchpadApp {
                     ui.label(egui::RichText::new("OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE").size(license_size));
                     ui.label(egui::RichText::new("SOFTWARE.").size(license_size));
                 });
+        }
+
+        if self.file_change_prompt_open {
+            let mut prompt_open = self.file_change_prompt_open;
+            let mut action = None;
+            egui::Window::new("File changed on disk")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut prompt_open)
+                .show(ctx, |ui| {
+                    ui.label("The file has changed outside of Scratchpad.");
+                    ui.add_space(8.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Reload").clicked() {
+                            action = Some("reload");
+                        }
+                        if ui.button("Ignore").clicked() {
+                            action = Some("ignore");
+                        }
+                        if ui.button("Disable monitoring").clicked() {
+                            action = Some("disable");
+                        }
+                    });
+                });
+            self.file_change_prompt_open = prompt_open;
+            match action {
+                Some("reload") => {
+                    self.reload_from_disk();
+                    self.file_change_prompt_open = false;
+                }
+                Some("ignore") => {
+                    self.last_file_mtime = Self::read_file_mtime(&self.file_path);
+                    self.file_change_prompt_open = false;
+                }
+                Some("disable") => {
+                    self.settings.watch_file_changes = false;
+                    self.file_change_disabled = true;
+                    self.file_change_prompt_open = false;
+                }
+                _ => {}
+            }
         }
 
         if self.find_state.open {
