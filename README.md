@@ -11,7 +11,8 @@ Scratchpad is intentionally simple: it aims to be fast, predictable, and easy to
 
 - New / Open / Save / Save As with native Windows file dialogs
 - Open files via **drag and drop**
-- Open files via **command line** and Windows **“Open With”**
+- Open files via **command line** and Windows **"Open With"**
+- Watch files for external changes (prompt to reload/ignore/disable monitoring)
 - Recent files menu (deduplicated, max 10, persisted, missing file cleanup)
 - Unsaved changes prompt on **all exit paths** (menu and window close)
 
@@ -32,6 +33,8 @@ Scratchpad is intentionally simple: it aims to be fast, predictable, and easy to
 - Font family selection (monospace or proportional)
 - Line numbers with correct wrapping alignment
 - Word wrap toggle
+- Basic syntax highlighting
+- Limited Markdown highlighting
 - Scrollable editor
 - UI font locked for consistent layout
 
@@ -56,6 +59,24 @@ Scratchpad is intentionally simple: it aims to be fast, predictable, and easy to
 - Windows subsystem set to `windows` (no extra console window)
 - Embedded application icon (generated in code)
 - About dialog with version, build time, and MIT license
+- Automatic update checking
+
+## Hot Keys
+
+- Ctrl+N: New file
+- Ctrl+O: Open file
+- Ctrl+S: Save
+- Ctrl+Shift+S: Save As
+- Ctrl+F: Find
+- Ctrl+R: Find and Replace
+- Ctrl+H: Cycle highlighting mode (Off → Syntax → Markdown)
+- Ctrl+=: Increase font size
+- Ctrl+-: Decrease font size
+- Ctrl+C: Copy
+- Ctrl+X: Cut
+- Ctrl+V: Paste
+- Ctrl+A: Select all
+- Ctrl+Z: Undo
 
 ## Configuration & Data Storage
 
