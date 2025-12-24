@@ -2896,6 +2896,7 @@ dependencies = [
  "ico",
  "regex",
  "rfd",
+ "ron",
  "serde",
  "winres",
 ]

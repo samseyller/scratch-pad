@@ -8,6 +8,7 @@ use eframe::egui;
 use egui::text_edit::TextEditOutput;
 use serde::{Deserialize, Serialize};
 use regex::Regex;
+use ron::ser::PrettyConfig;
 
 /// Minimal Notepad-like app (single-file editor) using eframe/egui + rfd dialogs.
 ///
@@ -20,11 +21,13 @@ use regex::Regex;
 /// - egui already supports common text shortcuts (Ctrl+C/V/X/A) in the text editor.
 /// - Some eframe/egui versions differ in API; this code avoids newer methods like
 ///   TextEdit::wrap(bool) and Frame::close().
+const APP_ID: &str = "Scratchpad";
+
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         // Keep it simple, but give a comfortable window size.
         viewport: egui::ViewportBuilder::default()
-            .with_title("Scratchpad")
+            .with_title(APP_ID)
             .with_inner_size([900.0, 600.0])
             .with_icon(make_app_icon()),
         ..Default::default()
@@ -33,7 +36,7 @@ fn main() -> eframe::Result<()> {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
 
     eframe::run_native(
-        "Scratchpad",
+        APP_ID,
         native_options,
         Box::new(move |cc| Box::new(ScratchpadApp::new(cc, initial_path.clone()))),
     )
@@ -187,12 +190,10 @@ impl Default for ScratchpadApp {
 }
 
 impl ScratchpadApp {
-    fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
         let mut app = Self::default();
-        if let Some(storage) = cc.storage {
-            if let Some(settings) = eframe::get_value(storage, "scratchpad_settings") {
-                app.settings = settings;
-            }
+        if let Some(settings) = load_config_settings() {
+            app.settings = settings;
         }
         if let Some(path) = initial_path {
             app.do_open_path(path);
@@ -736,8 +737,8 @@ impl ScratchpadApp {
 }
 
 impl eframe::App for ScratchpadApp {
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, "scratchpad_settings", &self.settings);
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        let _ = save_config_settings(&self.settings);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1293,6 +1294,27 @@ impl eframe::App for ScratchpadApp {
 
 /// Write the full buffer to disk.
 /// This is intentionally tiny so the main app code reads cleanly.
+fn config_path() -> Option<PathBuf> {
+    eframe::storage_dir(APP_ID).map(|dir| dir.join("config.ron"))
+}
+
+fn load_config_settings() -> Option<AppSettings> {
+    let path = config_path()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    ron::from_str(&contents).ok()
+}
+
+fn save_config_settings(settings: &AppSettings) -> std::io::Result<()> {
+    let path = config_path().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Missing config path"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let pretty = PrettyConfig::new();
+    let contents = ron::ser::to_string_pretty(settings, pretty)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    std::fs::write(path, contents)
+}
+
 fn write_all_text(path: &Path, contents: &str) -> std::io::Result<()> {
     fs::write(path, contents)
 }

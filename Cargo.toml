@@ -9,6 +9,7 @@ eframe = { version = "0.27", features = ["persistence"] }
 rfd = "0.14"
 serde = { version = "1", features = ["derive"] }
 regex = "1"
+ron = "0.8"
 arboard = "3"
 
 [build-dependencies]
