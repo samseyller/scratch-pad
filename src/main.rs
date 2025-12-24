@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use arboard::Clipboard;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
@@ -307,6 +308,24 @@ impl ScratchpadApp {
         }
         ctx.set_style(style);
     }
+
+    fn send_editor_event(&mut self, ctx: &egui::Context, event: egui::Event) {
+        let editor_id = egui::Id::new("editor");
+        ctx.memory_mut(|mem| mem.request_focus(editor_id));
+        ctx.input_mut(|i| i.events.push(event));
+        self.request_editor_focus = true;
+    }
+
+    fn paste_from_clipboard(&mut self, ctx: &egui::Context) {
+        match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+            Ok(text) => {
+                if !text.is_empty() {
+                    self.send_editor_event(ctx, egui::Event::Paste(text));
+                }
+            }
+            Err(e) => self.set_error(format!("Clipboard paste failed: {e}")),
+        }
+    }
 }
 
 impl eframe::App for ScratchpadApp {
@@ -358,9 +377,34 @@ impl eframe::App for ScratchpadApp {
                 });
 
                 ui.menu_button("Edit", |ui| {
-                    // egui's TextEdit handles Ctrl+C/V/X/A on native platforms.
-                    // These menu items are mostly for familiarity.
-                    ui.label("Use Ctrl+C / Ctrl+V / Ctrl+X / Ctrl+A in the editor.");
+                    if ui.button("Copy (Ctrl+C)").clicked() {
+                        ui.close_menu();
+                        self.send_editor_event(ctx, egui::Event::Copy);
+                    }
+
+                    if ui.button("Cut (Ctrl+X)").clicked() {
+                        ui.close_menu();
+                        self.send_editor_event(ctx, egui::Event::Cut);
+                    }
+
+                    if ui.button("Paste (Ctrl+V)").clicked() {
+                        ui.close_menu();
+                        self.paste_from_clipboard(ctx);
+                    }
+
+                    if ui.button("Select All (Ctrl+A)").clicked() {
+                        ui.close_menu();
+                        self.send_editor_event(
+                            ctx,
+                            egui::Event::Key {
+                                key: egui::Key::A,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: egui::Modifiers::COMMAND,
+                            },
+                        );
+                    }
                 });
 
                 ui.menu_button("View", |ui| {
@@ -428,7 +472,7 @@ impl eframe::App for ScratchpadApp {
         // ─────────────────────────────────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
             // Stable ID helps keep focus/state consistent.
-            let editor_id = ui.make_persistent_id("editor");
+            let editor_id = egui::Id::new("editor");
             let show_line_numbers = self.settings.show_line_numbers;
 
             let font_id =
