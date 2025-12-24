@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 
 use arboard::Clipboard;
 use eframe::egui;
@@ -9,6 +11,8 @@ use egui::text_edit::TextEditOutput;
 use serde::{Deserialize, Serialize};
 use regex::Regex;
 use ron::ser::PrettyConfig;
+use semver::Version;
+use serde_json::Value;
 
 /// Minimal Notepad-like app (single-file editor) using eframe/egui + rfd dialogs.
 ///
@@ -72,6 +76,7 @@ struct AppSettings {
     show_line_numbers: bool,
     recent_files: Vec<String>,
     word_wrap: bool,
+    check_updates: bool,
 }
 
 impl Default for AppSettings {
@@ -82,6 +87,7 @@ impl Default for AppSettings {
             show_line_numbers: true,
             recent_files: Vec::new(),
             word_wrap: true,
+            check_updates: true,
         }
     }
 }
@@ -172,6 +178,11 @@ struct ScratchpadApp {
     /// Find/replace panel state.
     find_state: FindState,
     about_open: bool,
+
+    update_available: Option<String>,
+    update_available_url: Option<String>,
+    update_check_in_flight: bool,
+    update_rx: Option<Receiver<UpdateCheckResult>>,
 }
 
 impl Default for ScratchpadApp {
@@ -188,18 +199,25 @@ impl Default for ScratchpadApp {
             settings: AppSettings::default(),
             find_state: FindState::default(),
             about_open: false,
+            update_available: None,
+            update_available_url: None,
+            update_check_in_flight: false,
+            update_rx: None,
         }
     }
 }
 
 impl ScratchpadApp {
-    fn new(_cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
         let mut app = Self::default();
         if let Some(settings) = load_config_settings() {
             app.settings = settings;
         }
         if let Some(path) = initial_path {
             app.do_open_path(path);
+        }
+        if app.settings.check_updates {
+            app.start_update_check(cc.egui_ctx.clone());
         }
         app
     }
@@ -363,6 +381,42 @@ impl ScratchpadApp {
         self.maybe_defer_or_run(command);
     }
 
+    fn start_update_check(&mut self, ctx: egui::Context) {
+        if self.update_check_in_flight {
+            return;
+        }
+        self.update_check_in_flight = true;
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        thread::spawn(move || {
+            let result = check_for_update();
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_update_check(&mut self) {
+        let Some(rx) = &self.update_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.update_check_in_flight = false;
+                self.update_available = result.available;
+                self.update_available_url = result.url;
+                self.update_rx = None;
+                if let Some(err) = result.error {
+                    self.set_error(err);
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.update_check_in_flight = false;
+                self.update_rx = None;
+            }
+        }
+    }
+
     fn push_recent(&mut self, path: &Path) {
         let path_str = path.to_string_lossy().to_string();
         self.settings.recent_files.retain(|p| p != &path_str);
@@ -451,9 +505,16 @@ impl ScratchpadApp {
             String::new()
         };
 
+        let update_text = if let Some(version) = &self.update_available {
+            format!("  |  New Verison Available: v{version}")
+        } else {
+            String::new()
+        };
+
         format!(
             "{name}{dirty}  |  Ln {line}, Col {col}  |  Lines: {lines}  Chars: {chars}  |  Size: {size_text}  |  {line_ending}{selection_text}"
         )
+        + &update_text
     }
 
     fn apply_font_settings(&self, ctx: &egui::Context) {
@@ -746,6 +807,7 @@ impl eframe::App for ScratchpadApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_font_settings(ctx);
+        self.poll_update_check();
         let mut open_find = false;
         let mut open_replace = false;
         ctx.input_mut(|i| {
@@ -946,12 +1008,32 @@ impl eframe::App for ScratchpadApp {
                 });
 
                 ui.menu_button("Help", |ui| {
+                    if let Some(version) = &self.update_available {
+                        if ui.button(format!("Update to v{version}")).clicked() {
+                            ui.close_menu();
+                            if let Some(url) = &self.update_available_url {
+                                ctx.open_url(egui::OpenUrl::new_tab(url));
+                            } else {
+                                ctx.open_url(egui::OpenUrl::new_tab("https://github.com/samseyller/scratch-pad/releases"));
+                            }
+                        }
+                    }
+                    let mut changed = false;
+                    changed |= ui
+                        .checkbox(&mut self.settings.check_updates, "Check for Updates")
+                        .changed();
+                    if changed && self.settings.check_updates {
+                        self.start_update_check(ctx.clone());
+                    } else if changed && !self.settings.check_updates {
+                        self.update_available = None;
+                    }
+
                     if ui.button("Releases").clicked() {
                         ui.close_menu();
                         ctx.open_url(egui::OpenUrl::new_tab("https://github.com/samseyller/scratch-pad/releases"));
                     }
 
-                    if ui.button("About").clicked() {
+                                        if ui.button("About").clicked() {
                         ui.close_menu();
                         self.about_open = true;
                     }
@@ -1369,6 +1451,85 @@ fn save_config_settings(settings: &AppSettings) -> std::io::Result<()> {
     let contents = ron::ser::to_string_pretty(settings, pretty)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     std::fs::write(path, contents)
+}
+
+struct UpdateCheckResult {
+    available: Option<String>,
+    url: Option<String>,
+    error: Option<String>,
+}
+
+fn check_for_update() -> UpdateCheckResult {
+    let url = "https://api.github.com/repos/samseyller/scratch-pad/releases/latest";
+    let response = ureq::get(url)
+        .set("User-Agent", "scratchpad")
+        .call();
+
+    let response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, response)) => {
+            let status = response.status_text().to_string();
+            return UpdateCheckResult {
+                available: None,
+                url: None,
+                error: Some(format!("Update check failed: {code} {status}")),
+            };
+        }
+        Err(ureq::Error::Transport(err)) => {
+            return UpdateCheckResult {
+                available: None,
+                url: None,
+                error: Some(format!("Update check failed: {err}")),
+            };
+        }
+    };
+
+    let value = match response.into_json::<Value>() {
+        Ok(value) => value,
+        Err(err) => {
+            return UpdateCheckResult {
+                available: None,
+                url: None,
+                error: Some(format!("Update check failed: {err}")),
+            };
+        }
+    };
+
+    let tag = value
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim_start_matches('v')
+        .to_string();
+
+    let Ok(latest) = Version::parse(&tag) else {
+        return UpdateCheckResult {
+            available: None,
+            url: None,
+            error: Some("Update check failed.".to_string()),
+        };
+    };
+    let Ok(current) = Version::parse(env!("CARGO_PKG_VERSION")) else {
+        return UpdateCheckResult {
+            available: None,
+            url: None,
+            error: None,
+        };
+    };
+
+    if latest > current {
+        UpdateCheckResult {
+            available: Some(latest.to_string()),
+            url: value.get("html_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            error: None,
+        }
+    } else {
+        UpdateCheckResult {
+            available: None,
+            url: None,
+            error: None,
+        }
+    }
 }
 
 fn write_all_text(path: &Path, contents: &str) -> std::io::Result<()> {
