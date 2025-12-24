@@ -1027,6 +1027,20 @@ impl eframe::App for ScratchpadApp {
                         self.find_state.open = true;
                         self.find_state.show_replace = true;
                     }
+
+                    ui.separator();
+                    let watch_changed = ui
+                        .checkbox(
+                            &mut self.settings.watch_file_changes,
+                            "Monitor File for Changes",
+                        )
+                        .changed();
+                    if watch_changed {
+                        self.file_change_disabled = !self.settings.watch_file_changes;
+                        if self.settings.watch_file_changes {
+                            self.last_file_mtime = Self::read_file_mtime(&self.file_path);
+                        }
+                    }
                 });
 
                 ui.menu_button("View", |ui| {
