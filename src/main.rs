@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use arboard::Clipboard;
 use eframe::egui;
+use egui::text_edit::TextEditOutput;
 use serde::{Deserialize, Serialize};
+use regex::Regex;
 
 /// Minimal Notepad-like app (single-file editor) using eframe/egui + rfd dialogs.
 ///
@@ -65,6 +67,47 @@ impl Default for AppSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FindMode {
+    Literal,
+    Regex,
+}
+
+#[derive(Clone, Debug)]
+struct FindState {
+    open: bool,
+    show_replace: bool,
+    query: String,
+    replace: String,
+    mode: FindMode,
+    case_sensitive: bool,
+    highlight_all: bool,
+    last_result: Option<String>,
+}
+
+impl Default for FindState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            show_replace: false,
+            query: String::new(),
+            replace: String::new(),
+            mode: FindMode::Literal,
+            case_sensitive: false,
+            highlight_all: false,
+            last_result: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FindMatch {
+    start_byte: usize,
+    end_byte: usize,
+    start_char: usize,
+    end_char: usize,
+}
+
 /// If the user has unsaved changes and tries to do something destructive,
 /// we defer that action until they answer the prompt.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +143,9 @@ struct ScratchpadApp {
 
     /// UI settings that should persist between runs.
     settings: AppSettings,
+
+    /// Find/replace panel state.
+    find_state: FindState,
 }
 
 impl Default for ScratchpadApp {
@@ -112,6 +158,7 @@ impl Default for ScratchpadApp {
             request_editor_focus: true,
             last_error: None,
             settings: AppSettings::default(),
+            find_state: FindState::default(),
         }
     }
 }
@@ -309,6 +356,244 @@ impl ScratchpadApp {
         ctx.set_style(style);
     }
 
+    fn set_find_result(&mut self, msg: impl Into<String>) {
+        self.find_state.last_result = Some(msg.into());
+    }
+
+    fn build_find_regex(&self) -> Result<Regex, String> {
+        if self.find_state.query.is_empty() {
+            return Err("Find text is empty".to_string());
+        }
+        let pattern = match self.find_state.mode {
+            FindMode::Literal => regex::escape(&self.find_state.query),
+            FindMode::Regex => self.find_state.query.clone(),
+        };
+        let mut builder = regex::RegexBuilder::new(&pattern);
+        builder.case_insensitive(!self.find_state.case_sensitive);
+        builder.build().map_err(|e| e.to_string())
+    }
+
+    fn byte_to_char_index(text: &str, byte_index: usize) -> usize {
+        text[..byte_index].chars().count()
+    }
+
+    fn current_selection_char_range(&self, ctx: &egui::Context) -> Option<(usize, usize)> {
+        let editor_id = egui::Id::new("editor");
+        egui::TextEdit::load_state(ctx, editor_id)
+            .and_then(|state| state.cursor.char_range())
+            .map(|range| {
+                let [min, max] = range.sorted();
+                (min.index, max.index)
+            })
+    }
+
+    fn select_match(&mut self, ctx: &egui::Context, start_char: usize, end_char: usize) {
+        let editor_id = egui::Id::new("editor");
+        if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) {
+            let range = egui::text::CCursorRange::two(
+                egui::text::CCursor::new(start_char),
+                egui::text::CCursor::new(end_char),
+            );
+            state.cursor.set_char_range(Some(range));
+            state.store(ctx, editor_id);
+        }
+        ctx.memory_mut(|mem| mem.request_focus(editor_id));
+        self.request_editor_focus = true;
+    }
+
+    fn find_matches_with(&self, regex: &Regex) -> Vec<FindMatch> {
+        regex
+            .find_iter(&self.text)
+            .map(|m| {
+                let start_char = Self::byte_to_char_index(&self.text, m.start());
+                let end_char = Self::byte_to_char_index(&self.text, m.end());
+                FindMatch {
+                    start_byte: m.start(),
+                    end_byte: m.end(),
+                    start_char,
+                    end_char,
+                }
+            })
+            .collect()
+    }
+
+    fn find_next_match_index(&self, ctx: &egui::Context, matches: &[FindMatch]) -> usize {
+        let start_from = self
+            .current_selection_char_range(ctx)
+            .map(|(_, end)| end)
+            .unwrap_or(0);
+        matches
+            .iter()
+            .position(|m| m.start_char >= start_from)
+            .unwrap_or(0)
+    }
+
+    fn find_prev_match_index(&self, ctx: &egui::Context, matches: &[FindMatch]) -> usize {
+        let start_from = self
+            .current_selection_char_range(ctx)
+            .map(|(start, _)| start)
+            .unwrap_or(usize::MAX);
+        let mut idx = None;
+        for (i, m) in matches.iter().enumerate() {
+            if m.start_char < start_from {
+                idx = Some(i);
+            }
+        }
+        idx.unwrap_or_else(|| matches.len().saturating_sub(1))
+    }
+
+    fn find_next(&mut self, ctx: &egui::Context) {
+        let regex = match self.build_find_regex() {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_find_result(e);
+                return;
+            }
+        };
+        let matches = self.find_matches_with(&regex);
+        if matches.is_empty() {
+            self.set_find_result("No matches");
+            return;
+        }
+        let idx = self.find_next_match_index(ctx, &matches);
+        let m = matches[idx];
+        self.select_match(ctx, m.start_char, m.end_char);
+        self.set_find_result(format!("Match {}/{}", idx + 1, matches.len()));
+    }
+
+    fn find_previous(&mut self, ctx: &egui::Context) {
+        let regex = match self.build_find_regex() {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_find_result(e);
+                return;
+            }
+        };
+        let matches = self.find_matches_with(&regex);
+        if matches.is_empty() {
+            self.set_find_result("No matches");
+            return;
+        }
+        let idx = self.find_prev_match_index(ctx, &matches);
+        let m = matches[idx];
+        self.select_match(ctx, m.start_char, m.end_char);
+        self.set_find_result(format!("Match {}/{}", idx + 1, matches.len()));
+    }
+
+    fn find_all(&mut self, ctx: &egui::Context) {
+        let regex = match self.build_find_regex() {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_find_result(e);
+                return;
+            }
+        };
+        let matches = self.find_matches_with(&regex);
+        if matches.is_empty() {
+            self.set_find_result("No matches");
+            return;
+        }
+        self.find_state.highlight_all = true;
+        let m = matches[0];
+        self.select_match(ctx, m.start_char, m.end_char);
+        self.set_find_result(format!("Found {} matches", matches.len()));
+    }
+
+    fn replace_current(&mut self, ctx: &egui::Context) {
+        let regex = match self.build_find_regex() {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_find_result(e);
+                return;
+            }
+        };
+        let matches = self.find_matches_with(&regex);
+        if matches.is_empty() {
+            self.set_find_result("No matches");
+            return;
+        }
+        let mut target_idx = None;
+        if let Some((sel_start, sel_end)) = self.current_selection_char_range(ctx) {
+            for (i, m) in matches.iter().enumerate() {
+                if m.start_char == sel_start && m.end_char == sel_end {
+                    target_idx = Some(i);
+                    break;
+                }
+            }
+        }
+        let idx = target_idx.unwrap_or_else(|| self.find_next_match_index(ctx, &matches));
+        let m = matches[idx];
+        let replacement = if self.find_state.mode == FindMode::Regex {
+            regex
+                .replace(&self.text[m.start_byte..m.end_byte], self.find_state.replace.as_str())
+                .to_string()
+        } else {
+            self.find_state.replace.clone()
+        };
+        self.text.replace_range(m.start_byte..m.end_byte, &replacement);
+        let new_end = m.start_char + replacement.chars().count();
+        self.select_match(ctx, m.start_char, new_end);
+        self.set_find_result(format!("Replaced {}/{}", idx + 1, matches.len()));
+    }
+
+    fn replace_all(&mut self) {
+        let regex = match self.build_find_regex() {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_find_result(e);
+                return;
+            }
+        };
+        let matches = self.find_matches_with(&regex);
+        if matches.is_empty() {
+            self.set_find_result("No matches");
+            return;
+        }
+        let replaced = regex
+            .replace_all(&self.text, self.find_state.replace.as_str())
+            .to_string();
+        self.text = replaced;
+        self.request_editor_focus = true;
+        self.set_find_result(format!("Replaced {}", matches.len()));
+    }
+
+    fn paint_find_highlights(&mut self, ui: &egui::Ui, output: &TextEditOutput) {
+        if !self.find_state.highlight_all {
+            return;
+        }
+        let regex = match self.build_find_regex() {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_find_result(e);
+                self.find_state.highlight_all = false;
+                return;
+            }
+        };
+        let matches = self.find_matches_with(&regex);
+        if matches.is_empty() {
+            return;
+        }
+        let painter = ui.painter_at(output.text_clip_rect);
+        for m in matches {
+            let range = egui::text::CursorRange::two(
+                output
+                    .galley
+                    .from_ccursor(egui::text::CCursor::new(m.start_char)),
+                output
+                    .galley
+                    .from_ccursor(egui::text::CCursor::new(m.end_char)),
+            );
+            egui::text_selection::visuals::paint_text_selection(
+                &painter,
+                ui.visuals(),
+                output.galley_pos,
+                &output.galley,
+                &range,
+                None,
+            );
+        }
+    }
+
     fn send_editor_event(&mut self, ctx: &egui::Context, event: egui::Event) {
         let editor_id = egui::Id::new("editor");
         ctx.memory_mut(|mem| mem.request_focus(editor_id));
@@ -335,6 +620,24 @@ impl eframe::App for ScratchpadApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_font_settings(ctx);
+        let mut open_find = false;
+        let mut open_replace = false;
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::F) {
+                open_find = true;
+            }
+            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::R) {
+                open_replace = true;
+            }
+        });
+        if open_find {
+            self.find_state.open = true;
+            self.find_state.show_replace = false;
+        }
+        if open_replace {
+            self.find_state.open = true;
+            self.find_state.show_replace = true;
+        }
         // ─────────────────────────────────────────────────────────────────────
         // Top menu bar
         // ─────────────────────────────────────────────────────────────────────
@@ -405,6 +708,18 @@ impl eframe::App for ScratchpadApp {
                             },
                         );
                     }
+
+                    ui.separator();
+                    if ui.button("Find (Ctrl+F)").clicked() {
+                        ui.close_menu();
+                        self.find_state.open = true;
+                        self.find_state.show_replace = false;
+                    }
+                    if ui.button("Find and Replace (Ctrl+R)").clicked() {
+                        ui.close_menu();
+                        self.find_state.open = true;
+                        self.find_state.show_replace = true;
+                    }
                 });
 
                 ui.menu_button("View", |ui| {
@@ -452,6 +767,94 @@ impl eframe::App for ScratchpadApp {
                 });
             });
         });
+
+        if self.find_state.open {
+            let mut find_open = self.find_state.open;
+            let title = if self.find_state.show_replace {
+                "Find and Replace"
+            } else {
+                "Find"
+            };
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut find_open)
+                .show(ctx, |ui| {
+                    let mut find_changed = false;
+                    ui.horizontal(|ui| {
+                        ui.label("Find");
+                        find_changed |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.find_state.query)
+                                    .desired_width(240.0),
+                            )
+                            .changed();
+                    });
+
+                    if self.find_state.show_replace {
+                        ui.horizontal(|ui| {
+                            ui.label("Replace");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.find_state.replace)
+                                    .desired_width(240.0),
+                            );
+                        });
+                    }
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Mode");
+                        find_changed |= ui
+                            .radio_value(&mut self.find_state.mode, FindMode::Literal, "Literal")
+                            .changed();
+                        find_changed |= ui
+                            .radio_value(&mut self.find_state.mode, FindMode::Regex, "Regex")
+                            .changed();
+                    });
+                    find_changed |= ui
+                        .checkbox(&mut self.find_state.case_sensitive, "Case sensitive")
+                        .changed();
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Find Next").clicked() {
+                            self.find_next(ctx);
+                        }
+                        if ui.button("Find Previous").clicked() {
+                            self.find_previous(ctx);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Find All").clicked() {
+                            self.find_all(ctx);
+                        }
+                    });
+                    if self.find_state.show_replace {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Replace").clicked() {
+                                self.replace_current(ctx);
+                            }
+                            if ui.button("Replace All").clicked() {
+                                self.replace_all();
+                            }
+                        });
+                    }
+
+                    if let Some(msg) = &self.find_state.last_result {
+                        ui.add_space(6.0);
+                        ui.label(msg);
+                    }
+
+                    if find_changed {
+                        self.find_state.highlight_all = false;
+                    }
+                });
+            self.find_state.open = find_open;
+            if !find_open {
+                self.find_state.highlight_all = false;
+            }
+        }
 
         // ─────────────────────────────────────────────────────────────────────
         // Bottom status bar
@@ -571,7 +974,19 @@ impl eframe::App for ScratchpadApp {
                             .id(editor_id)
                             .desired_width(text_width);
 
-                        ui.add_sized([text_width, ui.available_height()], text_edit)
+                        let output = ui
+                            .allocate_ui_with_layout(
+                                egui::vec2(text_width, ui.available_height()),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| text_edit.show(ui),
+                            )
+                            .inner;
+
+                        if self.find_state.highlight_all {
+                            self.paint_find_highlights(ui, &output);
+                        }
+
+                        output.response.clone()
                     })
                     .inner
                 })
