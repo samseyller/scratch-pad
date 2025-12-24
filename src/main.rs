@@ -364,8 +364,8 @@ impl ScratchpadApp {
         }
     }
 
-    /// A compact status string: file name + dirty marker + some counts.
-    fn status_text(&self) -> String {
+    /// A compact status string: file name + dirty marker + counts + cursor info.
+    fn status_text(&self, ctx: &egui::Context) -> String {
         let name = self
             .file_path
             .as_ref()
@@ -383,11 +383,46 @@ impl ScratchpadApp {
 
         let chars = self.text.chars().count();
 
+        let mut line = 1usize;
+        let mut col = 1usize;
+        let mut selection_len = 0usize;
+        if let Some(state) = egui::TextEdit::load_state(ctx, egui::Id::new("editor")) {
+            if let Some(range) = state.cursor.char_range() {
+                let cursor_idx = range.primary.index;
+                for (idx, ch) in self.text.chars().enumerate() {
+                    if idx >= cursor_idx {
+                        break;
+                    }
+                    if ch == '\n' {
+                        line += 1;
+                        col = 1;
+                    } else {
+                        col += 1;
+                    }
+                }
+
+                let [min, max] = range.sorted();
+                selection_len = max.index.saturating_sub(min.index);
+            }
+        }
+
+        let size_bytes = self.apply_line_ending(&self.text).as_bytes().len();
+        let size_text = format_size(size_bytes);
+
         let line_ending = match self.line_ending {
             LineEnding::Lf => "LF",
             LineEnding::CrLf => "CRLF",
         };
-        format!("{name}{dirty}  |  Lines: {lines}  Chars: {chars}  |  {line_ending}")
+
+        let selection_text = if selection_len > 0 {
+            format!("  |  Sel: {selection_len}")
+        } else {
+            String::new()
+        };
+
+        format!(
+            "{name}{dirty}  |  Ln {line}, Col {col}  |  Lines: {lines}  Chars: {chars}  |  Size: {size_text}  |  {line_ending}{selection_text}"
+        )
     }
 
     fn apply_font_settings(&self, ctx: &egui::Context) {
@@ -904,7 +939,7 @@ impl eframe::App for ScratchpadApp {
         // ─────────────────────────────────────────────────────────────────────
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(self.status_text());
+                ui.label(self.status_text(ctx));
 
                 if let Some(err) = &self.last_error {
                     ui.separator();
@@ -1137,4 +1172,23 @@ impl eframe::App for ScratchpadApp {
 /// This is intentionally tiny so the main app code reads cleanly.
 fn write_all_text(path: &Path, contents: &str) -> std::io::Result<()> {
     fs::write(path, contents)
+}
+
+fn format_size(bytes: usize) -> String {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0usize;
+    while size >= 1024.0 && unit + 1 < units.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", units[unit])
+    } else if size >= 100.0 {
+        format!("{:.0} {}", size, units[unit])
+    } else if size >= 10.0 {
+        format!("{:.1} {}", size, units[unit])
+    } else {
+        format!("{:.2} {}", size, units[unit])
+    }
 }
