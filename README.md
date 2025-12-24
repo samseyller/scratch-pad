@@ -136,6 +136,11 @@ The compiled executable will be located at:
 
 `cargo run`
 
+### Accessibility (AccessKit)
+
+AccessKit support is disabled by default for stability. To enable it when building:
+
+`cargo run --features accesskit`
 
 ## License
 
