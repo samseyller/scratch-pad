@@ -453,8 +453,7 @@ impl ScratchpadApp {
     fn apply_font_settings(&self, ctx: &egui::Context) {
         let mut style = (*ctx.style()).clone();
         for (_text_style, font_id) in style.text_styles.iter_mut() {
-            font_id.size = self.settings.font_size;
-            font_id.family = self.settings.font_family.to_egui();
+            font_id.size = 14.0;
         }
         ctx.set_style(style);
     }
@@ -1133,9 +1132,10 @@ impl eframe::App for ScratchpadApp {
                             );
                         }
 
-                        let text_edit = egui::TextEdit::multiline(&mut self.text)
-                            .id(editor_id)
-                            .desired_width(text_width);
+            let text_edit = egui::TextEdit::multiline(&mut self.text)
+                .id(editor_id)
+                .font(font_id.clone())
+                .desired_width(text_width);
 
                         let output = ui
                             .allocate_ui_with_layout(
