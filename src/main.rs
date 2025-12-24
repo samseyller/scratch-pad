@@ -77,6 +77,7 @@ struct AppSettings {
     show_line_numbers: bool,
     recent_files: Vec<String>,
     word_wrap: bool,
+    syntax_highlighting: bool,
     check_updates: bool,
     watch_file_changes: bool,
 }
@@ -89,6 +90,7 @@ impl Default for AppSettings {
             show_line_numbers: true,
             recent_files: Vec::new(),
             word_wrap: true,
+            syntax_highlighting: true,
             check_updates: true,
             watch_file_changes: true,
         }
@@ -591,18 +593,190 @@ impl ScratchpadApp {
         wrap: bool,
         wrap_width: f32,
         font_id: egui::FontId,
+        syntax_highlighting: bool,
     ) -> impl FnMut(&egui::Ui, &str, f32) -> std::sync::Arc<egui::Galley> {
         move |ui, text, _wrap_width| {
             let max_width = if wrap { wrap_width } else { f32::INFINITY };
-            let mut job = egui::text::LayoutJob::simple(
-                text.to_owned(),
-                font_id.clone(),
-                ui.visuals().text_color(),
-                max_width,
-            );
-            job.wrap.max_width = max_width;
-            ui.fonts(|f| f.layout_job(job))
+            if syntax_highlighting {
+                let job =
+                    Self::build_syntax_highlight_job(text, &font_id, max_width, ui.visuals());
+                ui.fonts(|f| f.layout_job(job))
+            } else {
+                let mut job = egui::text::LayoutJob::simple(
+                    text.to_owned(),
+                    font_id.clone(),
+                    ui.visuals().text_color(),
+                    max_width,
+                );
+                job.wrap.max_width = max_width;
+                ui.fonts(|f| f.layout_job(job))
+            }
         }
+    }
+
+    fn is_ident_start(ch: char) -> bool {
+        ch == '_' || ch.is_ascii_alphabetic()
+    }
+
+    fn is_ident_char(ch: char) -> bool {
+        Self::is_ident_start(ch) || ch.is_ascii_digit()
+    }
+
+    fn is_keyword(token: &str) -> bool {
+        matches!(
+            token,
+                "as"
+                | "async"
+                | "await"
+                | "break"
+                | "const"
+                | "continue"
+                | "crate"
+                | "dyn"
+                | "else"
+                | "enum"
+                | "extern"
+                | "false"
+                | "fn"
+                | "for"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "pub"
+                | "ref"
+                | "return"
+                | "self"
+                | "Self"
+                | "static"
+                | "struct"
+                | "super"
+                | "trait"
+                | "true"
+                | "type"
+                | "unsafe"
+                | "use"
+                | "where"
+                | "while"
+        )
+    }
+
+    fn build_syntax_highlight_job(
+        text: &str,
+        font_id: &egui::FontId,
+        wrap_width: f32,
+        visuals: &egui::Visuals,
+    ) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = wrap_width;
+
+        let normal = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: visuals.text_color(),
+            ..Default::default()
+        };
+        let comment = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: egui::Color32::from_gray(140),
+            ..Default::default()
+        };
+        let string = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: egui::Color32::from_rgb(160, 220, 160),
+            ..Default::default()
+        };
+        let keyword = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: egui::Color32::from_rgb(120, 170, 255),
+            ..Default::default()
+        };
+        let number = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: egui::Color32::from_rgb(220, 200, 140),
+            ..Default::default()
+        };
+
+        let mut idx = 0;
+        while idx < text.len() {
+            let rest = &text[idx..];
+            if rest.starts_with("//") {
+                let end = rest.find('\n').map(|p| idx + p).unwrap_or(text.len());
+                job.append(&text[idx..end], 0.0, comment.clone());
+                idx = end;
+                continue;
+            }
+
+            if rest.starts_with('"') {
+                let mut end = idx + 1;
+                let mut escape = false;
+                while end < text.len() {
+                    let ch = text[end..].chars().next().unwrap();
+                    let ch_len = ch.len_utf8();
+                    if escape {
+                        escape = false;
+                        end += ch_len;
+                        continue;
+                    }
+                    if ch == '\\' {
+                        escape = true;
+                        end += ch_len;
+                        continue;
+                    }
+                    end += ch_len;
+                    if ch == '"' {
+                        break;
+                    }
+                }
+                job.append(&text[idx..end], 0.0, string.clone());
+                idx = end;
+                continue;
+            }
+
+            let ch = rest.chars().next().unwrap();
+            if Self::is_ident_start(ch) {
+                let mut end = idx + ch.len_utf8();
+                while end < text.len() {
+                    let next = text[end..].chars().next().unwrap();
+                    if !Self::is_ident_char(next) {
+                        break;
+                    }
+                    end += next.len_utf8();
+                }
+                let token = &text[idx..end];
+                if Self::is_keyword(token) {
+                    job.append(token, 0.0, keyword.clone());
+                } else {
+                    job.append(token, 0.0, normal.clone());
+                }
+                idx = end;
+                continue;
+            }
+
+            if ch.is_ascii_digit() {
+                let mut end = idx + ch.len_utf8();
+                while end < text.len() {
+                    let next = text[end..].chars().next().unwrap();
+                    if !(next.is_ascii_digit() || next == '.') {
+                        break;
+                    }
+                    end += next.len_utf8();
+                }
+                job.append(&text[idx..end], 0.0, number.clone());
+                idx = end;
+                continue;
+            }
+
+            let ch_len = ch.len_utf8();
+            job.append(&text[idx..idx + ch_len], 0.0, normal.clone());
+            idx += ch_len;
+        }
+
+        job
     }
 
     fn set_find_result(&mut self, msg: impl Into<String>) {
@@ -1078,6 +1252,12 @@ impl eframe::App for ScratchpadApp {
                     changed |= ui
                         .checkbox(&mut self.settings.word_wrap, "Word wrap")
                         .changed();
+                    changed |= ui
+                        .checkbox(
+                            &mut self.settings.syntax_highlighting,
+                            "Syntax highlighting",
+                        )
+                        .changed();
                     let watch_changed = ui
                         .checkbox(&mut self.settings.watch_file_changes, "File monitoring")
                         .changed();
@@ -1440,6 +1620,7 @@ impl eframe::App for ScratchpadApp {
                             self.settings.word_wrap,
                             wrap_width,
                             font_id.clone(),
+                            self.settings.syntax_highlighting,
                         );
                         let text_edit = egui::TextEdit::multiline(&mut self.text)
                             .id(editor_id)
