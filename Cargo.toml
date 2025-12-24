@@ -1,17 +1,23 @@
 [package]
 name = "scratchpad"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 build = "build.rs"
 
 [dependencies]
-eframe = { version = "0.27", features = ["persistence"] }
+eframe = { version = "0.27", default-features = false, features = ["persistence", "glow", "default_fonts"] }
 rfd = "0.14"
 serde = { version = "1", features = ["derive"] }
 regex = "1"
 ron = "0.8"
 arboard = "3"
+semver = "1"
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+
+[features]
+accesskit = ["eframe/accesskit"]
 
 [build-dependencies]
 chrono = "0.4"

@@ -2,6 +2,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 
 use arboard::Clipboard;
 use eframe::egui;
@@ -9,6 +12,8 @@ use egui::text_edit::TextEditOutput;
 use serde::{Deserialize, Serialize};
 use regex::Regex;
 use ron::ser::PrettyConfig;
+use semver::Version;
+use serde_json::Value;
 
 /// Minimal Notepad-like app (single-file editor) using eframe/egui + rfd dialogs.
 ///
@@ -64,6 +69,13 @@ enum LineEnding {
     CrLf,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum HighlightMode {
+    Off,
+    Syntax,
+    Markdown,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct AppSettings {
@@ -72,6 +84,9 @@ struct AppSettings {
     show_line_numbers: bool,
     recent_files: Vec<String>,
     word_wrap: bool,
+    highlight_mode: HighlightMode,
+    check_updates: bool,
+    watch_file_changes: bool,
 }
 
 impl Default for AppSettings {
@@ -82,6 +97,9 @@ impl Default for AppSettings {
             show_line_numbers: true,
             recent_files: Vec::new(),
             word_wrap: true,
+            highlight_mode: HighlightMode::Syntax,
+            check_updates: true,
+            watch_file_changes: true,
         }
     }
 }
@@ -154,6 +172,9 @@ struct ScratchpadApp {
     /// Original line-ending style of the file on disk.
     line_ending: LineEnding,
 
+    /// Last known modified timestamp for the opened file.
+    last_file_mtime: Option<SystemTime>,
+
     /// If set, show the "Unsaved changes" dialog and then run this action.
     pending_action: Option<PendingAction>,
 
@@ -172,6 +193,14 @@ struct ScratchpadApp {
     /// Find/replace panel state.
     find_state: FindState,
     about_open: bool,
+
+    update_available: Option<String>,
+    update_available_url: Option<String>,
+    update_check_in_flight: bool,
+    update_rx: Option<Receiver<UpdateCheckResult>>,
+
+    file_change_prompt_open: bool,
+    file_change_disabled: bool,
 }
 
 impl Default for ScratchpadApp {
@@ -181,6 +210,7 @@ impl Default for ScratchpadApp {
             file_path: None,
             saved_snapshot: String::new(),
             line_ending: LineEnding::Lf,
+            last_file_mtime: None,
             pending_action: None,
             request_editor_focus: true,
             reset_editor_state: false,
@@ -188,18 +218,27 @@ impl Default for ScratchpadApp {
             settings: AppSettings::default(),
             find_state: FindState::default(),
             about_open: false,
+            update_available: None,
+            update_available_url: None,
+            update_check_in_flight: false,
+            update_rx: None,
+            file_change_prompt_open: false,
+            file_change_disabled: false,
         }
     }
 }
 
 impl ScratchpadApp {
-    fn new(_cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
         let mut app = Self::default();
         if let Some(settings) = load_config_settings() {
             app.settings = settings;
         }
         if let Some(path) = initial_path {
             app.do_open_path(path);
+        }
+        if app.settings.check_updates {
+            app.start_update_check(cc.egui_ctx.clone());
         }
         app
     }
@@ -240,6 +279,7 @@ impl ScratchpadApp {
         self.saved_snapshot.clear();
         self.file_path = None;
         self.line_ending = LineEnding::Lf;
+        self.last_file_mtime = None;
         self.clear_error();
         self.request_editor_focus = true;
         self.reset_editor_state = true;
@@ -267,6 +307,7 @@ impl ScratchpadApp {
                 self.line_ending = line_ending;
                 self.push_recent(&path);
                 self.file_path = Some(path);
+                self.last_file_mtime = Self::read_file_mtime(&self.file_path);
                 self.request_editor_focus = true;
                 self.reset_editor_state = true;
             }
@@ -286,6 +327,7 @@ impl ScratchpadApp {
                 self.line_ending = line_ending;
                 self.push_recent(&path);
                 self.file_path = Some(path);
+                self.last_file_mtime = Self::read_file_mtime(&self.file_path);
                 self.request_editor_focus = true;
                 self.reset_editor_state = true;
             }
@@ -320,6 +362,7 @@ impl ScratchpadApp {
 
         // Only mark "clean" after a successful write.
         self.saved_snapshot = self.text.clone();
+        self.last_file_mtime = Self::read_file_mtime(&self.file_path);
     }
 
     /// Save As: pick a file path, then save there.
@@ -345,6 +388,7 @@ impl ScratchpadApp {
 
         self.file_path = Some(path);
         self.saved_snapshot = self.text.clone();
+        self.last_file_mtime = Self::read_file_mtime(&self.file_path);
     }
 
     /// Suggest a filename in the Save As dialog.
@@ -361,6 +405,87 @@ impl ScratchpadApp {
 
     fn handle_command(&mut self, command: PendingAction) {
         self.maybe_defer_or_run(command);
+    }
+
+    fn read_file_mtime(path: &Option<PathBuf>) -> Option<SystemTime> {
+        let path = path.as_ref()?;
+        fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
+
+    fn check_external_change(&mut self) {
+        if self.file_change_disabled || !self.settings.watch_file_changes {
+            return;
+        }
+        let Some(path) = &self.file_path else {
+            return;
+        };
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        let Ok(modified) = metadata.modified() else {
+            return;
+        };
+        if let Some(last) = self.last_file_mtime {
+            if modified > last {
+                self.file_change_prompt_open = true;
+            }
+        } else {
+            self.last_file_mtime = Some(modified);
+        }
+    }
+
+    fn reload_from_disk(&mut self) {
+        let Some(path) = &self.file_path else {
+            return;
+        };
+        match fs::read_to_string(path) {
+            Ok(contents) => {
+                let (normalized, line_ending) = Self::normalize_line_endings(&contents);
+                self.text = normalized;
+                self.saved_snapshot = self.text.clone();
+                self.line_ending = line_ending;
+                self.last_file_mtime = Self::read_file_mtime(&self.file_path);
+                self.request_editor_focus = true;
+                self.reset_editor_state = true;
+            }
+            Err(e) => self.set_error(format!("Failed to reload file: {e}")),
+        }
+    }
+
+    fn start_update_check(&mut self, ctx: egui::Context) {
+        if self.update_check_in_flight {
+            return;
+        }
+        self.update_check_in_flight = true;
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        thread::spawn(move || {
+            let result = check_for_update();
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_update_check(&mut self) {
+        let Some(rx) = &self.update_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.update_check_in_flight = false;
+                self.update_available = result.available;
+                self.update_available_url = result.url;
+                self.update_rx = None;
+                if let Some(err) = result.error {
+                    self.set_error(err);
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.update_check_in_flight = false;
+                self.update_rx = None;
+            }
+        }
     }
 
     fn push_recent(&mut self, path: &Path) {
@@ -451,9 +576,16 @@ impl ScratchpadApp {
             String::new()
         };
 
+        let update_text = if let Some(version) = &self.update_available {
+            format!("  |  New Verison Available: v{version}")
+        } else {
+            String::new()
+        };
+
         format!(
             "{name}{dirty}  |  Ln {line}, Col {col}  |  Lines: {lines}  Chars: {chars}  |  Size: {size_text}  |  {line_ending}{selection_text}"
         )
+        + &update_text
     }
 
     fn apply_font_settings(&self, ctx: &egui::Context) {
@@ -468,18 +600,355 @@ impl ScratchpadApp {
         wrap: bool,
         wrap_width: f32,
         font_id: egui::FontId,
+        highlight_mode: HighlightMode,
     ) -> impl FnMut(&egui::Ui, &str, f32) -> std::sync::Arc<egui::Galley> {
         move |ui, text, _wrap_width| {
             let max_width = if wrap { wrap_width } else { f32::INFINITY };
-            let mut job = egui::text::LayoutJob::simple(
-                text.to_owned(),
-                font_id.clone(),
-                ui.visuals().text_color(),
-                max_width,
-            );
-            job.wrap.max_width = max_width;
-            ui.fonts(|f| f.layout_job(job))
+            match highlight_mode {
+                HighlightMode::Markdown => {
+                    let job =
+                        Self::build_markdown_highlight_job(text, &font_id, max_width, ui.visuals());
+                    ui.fonts(|f| f.layout_job(job))
+                }
+                HighlightMode::Syntax => {
+                    let job =
+                        Self::build_syntax_highlight_job(text, &font_id, max_width, ui.visuals());
+                    ui.fonts(|f| f.layout_job(job))
+                }
+                HighlightMode::Off => {
+                    let mut job = egui::text::LayoutJob::simple(
+                        text.to_owned(),
+                        font_id.clone(),
+                        ui.visuals().text_color(),
+                        max_width,
+                    );
+                    job.wrap.max_width = max_width;
+                    ui.fonts(|f| f.layout_job(job))
+                }
+            }
         }
+    }
+
+    fn is_ident_start(ch: char) -> bool {
+        ch == '_' || ch.is_ascii_alphabetic()
+    }
+
+    fn is_ident_char(ch: char) -> bool {
+        Self::is_ident_start(ch) || ch.is_ascii_digit()
+    }
+
+    fn is_keyword(token: &str) -> bool {
+        matches!(
+            token,
+                "as"
+                | "async"
+                | "await"
+                | "break"
+                | "const"
+                | "continue"
+                | "crate"
+                | "dyn"
+                | "else"
+                | "enum"
+                | "extern"
+                | "false"
+                | "fn"
+                | "for"
+                | "from"
+                | "if"
+                | "import"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "pass"
+                | "pub"
+                | "ref"
+                | "return"
+                | "self"
+                | "Self"
+                | "static"
+                | "struct"
+                | "super"
+                | "trait"
+                | "try"
+                | "except"
+                | "finally"
+                | "true"
+                | "type"
+                | "unsafe"
+                | "use"
+                | "where"
+                | "while"
+                | "def"
+        )
+    }
+
+    fn build_syntax_highlight_job(
+        text: &str,
+        font_id: &egui::FontId,
+        wrap_width: f32,
+        visuals: &egui::Visuals,
+    ) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = wrap_width;
+
+        let normal = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: visuals.text_color(),
+            ..Default::default()
+        };
+        let comment = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: egui::Color32::from_gray(140),
+            ..Default::default()
+        };
+        let string = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: egui::Color32::from_rgb(160, 220, 160),
+            ..Default::default()
+        };
+        let keyword = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: egui::Color32::from_rgb(120, 170, 255),
+            ..Default::default()
+        };
+        let number = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: egui::Color32::from_rgb(220, 200, 140),
+            ..Default::default()
+        };
+
+        let mut idx = 0;
+        while idx < text.len() {
+            let rest = &text[idx..];
+            if rest.starts_with("//") || rest.starts_with('#') {
+                let end = rest.find('\n').map(|p| idx + p).unwrap_or(text.len());
+                job.append(&text[idx..end], 0.0, comment.clone());
+                idx = end;
+                continue;
+            }
+
+            if rest.starts_with('"') {
+                let mut end = idx + 1;
+                let mut escape = false;
+                while end < text.len() {
+                    let ch = text[end..].chars().next().unwrap();
+                    let ch_len = ch.len_utf8();
+                    if escape {
+                        escape = false;
+                        end += ch_len;
+                        continue;
+                    }
+                    if ch == '\\' {
+                        escape = true;
+                        end += ch_len;
+                        continue;
+                    }
+                    end += ch_len;
+                    if ch == '"' {
+                        break;
+                    }
+                }
+                job.append(&text[idx..end], 0.0, string.clone());
+                idx = end;
+                continue;
+            }
+
+            let ch = rest.chars().next().unwrap();
+            if Self::is_ident_start(ch) {
+                let mut end = idx + ch.len_utf8();
+                while end < text.len() {
+                    let next = text[end..].chars().next().unwrap();
+                    if !Self::is_ident_char(next) {
+                        break;
+                    }
+                    end += next.len_utf8();
+                }
+                let token = &text[idx..end];
+                if Self::is_keyword(token) {
+                    job.append(token, 0.0, keyword.clone());
+                } else {
+                    job.append(token, 0.0, normal.clone());
+                }
+                idx = end;
+                continue;
+            }
+
+            if ch.is_ascii_digit() {
+                let mut end = idx + ch.len_utf8();
+                while end < text.len() {
+                    let next = text[end..].chars().next().unwrap();
+                    if !(next.is_ascii_digit() || next == '.') {
+                        break;
+                    }
+                    end += next.len_utf8();
+                }
+                job.append(&text[idx..end], 0.0, number.clone());
+                idx = end;
+                continue;
+            }
+
+            let ch_len = ch.len_utf8();
+            job.append(&text[idx..idx + ch_len], 0.0, normal.clone());
+            idx += ch_len;
+        }
+
+        job
+    }
+
+    fn build_markdown_highlight_job(
+        text: &str,
+        font_id: &egui::FontId,
+        wrap_width: f32,
+        visuals: &egui::Visuals,
+    ) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = wrap_width;
+
+        let normal = egui::TextFormat {
+            font_id: font_id.clone(),
+            color: visuals.text_color(),
+            ..Default::default()
+        };
+
+        let mut bold = normal.clone();
+        bold.extra_letter_spacing = 1.0;
+        bold.color = egui::Color32::from_rgb(235, 235, 235);
+        let mut italics = normal.clone();
+        let mut underline = normal.clone();
+        italics.italics = true;
+        underline.underline = egui::Stroke::new(1.0, underline.color);
+
+        let mut h1 = bold.clone();
+        h1.color = egui::Color32::from_rgb(160, 220, 160);
+        h1.underline = egui::Stroke::new(1.0, h1.color);
+
+        let mut h2 = bold.clone();
+        h2.color = egui::Color32::from_rgb(220, 200, 140);
+
+        let mut h3 = italics.clone();
+        h3.color = egui::Color32::from_rgb(120, 170, 255);
+
+        let mut code = normal.clone();
+        code.color = egui::Color32::from_rgb(140, 170, 210);
+
+        let mut in_code_fence = false;
+        for line in text.split_inclusive('\n') {
+            let trimmed = line.trim_start();
+            let is_fence = trimmed.starts_with("```");
+            if is_fence {
+                job.append(line, 0.0, code.clone());
+                in_code_fence = !in_code_fence;
+                continue;
+            }
+
+            if in_code_fence {
+                job.append(line, 0.0, code.clone());
+                continue;
+            }
+
+            let line_ends_with_newline = line.ends_with('\n');
+            let content = line.strip_suffix('\n').unwrap_or(line);
+            let trimmed_content = content.trim_start();
+
+            let heading_level = trimmed_content
+                .chars()
+                .take_while(|c| *c == '#')
+                .count();
+            if heading_level >= 1 && heading_level <= 3 {
+                let heading_text = trimmed_content
+                    .trim_start_matches('#')
+                    .trim_start();
+                let heading_format = match heading_level {
+                    1 => &h1,
+                    2 => &h2,
+                    _ => &h3,
+                };
+                job.append(heading_text, 0.0, heading_format.clone());
+                if line_ends_with_newline {
+                    job.append("\n", 0.0, normal.clone());
+                }
+                continue;
+            }
+
+            let mut idx = 0;
+            while idx < content.len() {
+                let rest = &content[idx..];
+
+                if rest.starts_with('`') {
+                    let end_rel = rest[1..].find('`').map(|p| p + 2);
+                    if let Some(end_rel) = end_rel {
+                        let end = idx + end_rel;
+                        let code_text = &content[idx + 1..end - 1];
+                        job.append("`", 0.0, code.clone());
+                        job.append(code_text, 0.0, code.clone());
+                        job.append("`", 0.0, code.clone());
+                        idx = end;
+                        continue;
+                    }
+                }
+
+                if rest.starts_with("**") {
+                    let end_rel = rest[2..].find("**").map(|p| p + 4);
+                    if let Some(end_rel) = end_rel {
+                        let end = idx + end_rel;
+                        let bold_text = &content[idx + 2..end - 2];
+                        job.append(bold_text, 0.0, bold.clone());
+                        idx = end;
+                        continue;
+                    }
+                }
+
+                if rest.starts_with("__") {
+                    let end_rel = rest[2..].find("__").map(|p| p + 4);
+                    if let Some(end_rel) = end_rel {
+                        let end = idx + end_rel;
+                        let underline_text = &content[idx + 2..end - 2];
+                        job.append(underline_text, 0.0, underline.clone());
+                        idx = end;
+                        continue;
+                    }
+                }
+
+                if rest.starts_with('*') {
+                    let end_rel = rest[1..].find('*').map(|p| p + 2);
+                    if let Some(end_rel) = end_rel {
+                        let end = idx + end_rel;
+                        let italic_text = &content[idx + 1..end - 1];
+                        job.append(italic_text, 0.0, italics.clone());
+                        idx = end;
+                        continue;
+                    }
+                }
+
+                if rest.starts_with('_') {
+                    let end_rel = rest[1..].find('_').map(|p| p + 2);
+                    if let Some(end_rel) = end_rel {
+                        let end = idx + end_rel;
+                        let italic_text = &content[idx + 1..end - 1];
+                        job.append(italic_text, 0.0, italics.clone());
+                        idx = end;
+                        continue;
+                    }
+                }
+
+                let ch = rest.chars().next().unwrap();
+                let ch_len = ch.len_utf8();
+                job.append(&content[idx..idx + ch_len], 0.0, normal.clone());
+                idx += ch_len;
+            }
+
+            if line_ends_with_newline {
+                job.append("\n", 0.0, normal.clone());
+            }
+        }
+
+        job
     }
 
     fn set_find_result(&mut self, msg: impl Into<String>) {
@@ -746,6 +1215,7 @@ impl eframe::App for ScratchpadApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_font_settings(ctx);
+        self.poll_update_check();
         let mut open_find = false;
         let mut open_replace = false;
         ctx.input_mut(|i| {
@@ -764,8 +1234,13 @@ impl eframe::App for ScratchpadApp {
             self.find_state.open = true;
             self.find_state.show_replace = true;
         }
+        self.check_external_change();
         let mut hotkey_new = false;
         let mut hotkey_open = false;
+        let mut hotkey_save = false;
+        let mut hotkey_save_as = false;
+        let mut hotkey_cycle_highlighting = false;
+        let mut font_step = 0.0;
         ctx.input_mut(|i| {
             if i.consume_key(egui::Modifiers::COMMAND, egui::Key::N) {
                 hotkey_new = true;
@@ -773,12 +1248,44 @@ impl eframe::App for ScratchpadApp {
             if i.consume_key(egui::Modifiers::COMMAND, egui::Key::O) {
                 hotkey_open = true;
             }
+            if i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S) {
+                hotkey_save_as = true;
+            } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::S) {
+                hotkey_save = true;
+            }
+            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::H) {
+                hotkey_cycle_highlighting = true;
+            }
+            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
+                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
+            {
+                font_step = 0.5;
+            } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus) {
+                font_step = -0.5;
+            }
         });
         if hotkey_new {
             self.handle_command(PendingAction::NewFile);
         }
         if hotkey_open {
             self.handle_command(PendingAction::OpenFile);
+        }
+        if hotkey_save_as {
+            self.do_save_as();
+        } else if hotkey_save {
+            self.do_save();
+        }
+        if hotkey_cycle_highlighting {
+            self.settings.highlight_mode = match self.settings.highlight_mode {
+                HighlightMode::Off => HighlightMode::Syntax,
+                HighlightMode::Syntax => HighlightMode::Markdown,
+                HighlightMode::Markdown => HighlightMode::Off,
+            };
+        }
+        if font_step != 0.0 {
+            let updated = (self.settings.font_size + font_step)
+                .clamp(10.0, 24.0);
+            self.settings.font_size = (updated * 2.0).round() / 2.0;
         }
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if close_requested && self.is_dirty() {
@@ -841,7 +1348,7 @@ impl eframe::App for ScratchpadApp {
                     // Enable save if dirty, or if the file has no path yet (so it can be saved).
                     let save_enabled = self.is_dirty() || self.file_path.is_none();
                     if ui
-                        .add_enabled(save_enabled, egui::Button::new("Save"))
+                        .add_enabled(save_enabled, egui::Button::new("Save (Ctrl+S)"))
                         .clicked()
                     {
                         ui.close_menu();
@@ -902,6 +1409,20 @@ impl eframe::App for ScratchpadApp {
                         self.find_state.open = true;
                         self.find_state.show_replace = true;
                     }
+
+                    ui.separator();
+                    let watch_changed = ui
+                        .checkbox(
+                            &mut self.settings.watch_file_changes,
+                            "Monitor File for Changes",
+                        )
+                        .changed();
+                    if watch_changed {
+                        self.file_change_disabled = !self.settings.watch_file_changes;
+                        if self.settings.watch_file_changes {
+                            self.last_file_mtime = Self::read_file_mtime(&self.file_path);
+                        }
+                    }
                 });
 
                 ui.menu_button("View", |ui| {
@@ -939,19 +1460,57 @@ impl eframe::App for ScratchpadApp {
                     changed |= ui
                         .checkbox(&mut self.settings.word_wrap, "Word wrap")
                         .changed();
-
+                    ui.separator();
+                    ui.label("Highlighting");
+                    changed |= ui
+                        .radio_value(&mut self.settings.highlight_mode, HighlightMode::Off, "Off")
+                        .changed();
+                    changed |= ui
+                        .radio_value(
+                            &mut self.settings.highlight_mode,
+                            HighlightMode::Syntax,
+                            "Syntax",
+                        )
+                        .changed();
+                    changed |= ui
+                        .radio_value(
+                            &mut self.settings.highlight_mode,
+                            HighlightMode::Markdown,
+                            "Markdown",
+                        )
+                        .changed();
                     if changed {
                         self.apply_font_settings(ctx);
                     }
                 });
 
                 ui.menu_button("Help", |ui| {
+                    if let Some(version) = &self.update_available {
+                        if ui.button(format!("Update to v{version}")).clicked() {
+                            ui.close_menu();
+                            if let Some(url) = &self.update_available_url {
+                                ctx.open_url(egui::OpenUrl::new_tab(url));
+                            } else {
+                                ctx.open_url(egui::OpenUrl::new_tab("https://github.com/samseyller/scratch-pad/releases"));
+                            }
+                        }
+                    }
+                    let mut changed = false;
+                    changed |= ui
+                        .checkbox(&mut self.settings.check_updates, "Check for Updates")
+                        .changed();
+                    if changed && self.settings.check_updates {
+                        self.start_update_check(ctx.clone());
+                    } else if changed && !self.settings.check_updates {
+                        self.update_available = None;
+                    }
+
                     if ui.button("Releases").clicked() {
                         ui.close_menu();
                         ctx.open_url(egui::OpenUrl::new_tab("https://github.com/samseyller/scratch-pad/releases"));
                     }
 
-                    if ui.button("About").clicked() {
+                                        if ui.button("About").clicked() {
                         ui.close_menu();
                         self.about_open = true;
                     }
@@ -1007,6 +1566,48 @@ impl eframe::App for ScratchpadApp {
                     ui.label(egui::RichText::new("OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE").size(license_size));
                     ui.label(egui::RichText::new("SOFTWARE.").size(license_size));
                 });
+        }
+
+        if self.file_change_prompt_open {
+            let mut prompt_open = self.file_change_prompt_open;
+            let mut action = None;
+            egui::Window::new("File changed on disk")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut prompt_open)
+                .show(ctx, |ui| {
+                    ui.label("The file has changed outside of Scratchpad.");
+                    ui.add_space(8.0);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Reload").clicked() {
+                            action = Some("reload");
+                        }
+                        if ui.button("Ignore").clicked() {
+                            action = Some("ignore");
+                        }
+                        if ui.button("Disable monitoring").clicked() {
+                            action = Some("disable");
+                        }
+                    });
+                });
+            self.file_change_prompt_open = prompt_open;
+            match action {
+                Some("reload") => {
+                    self.reload_from_disk();
+                    self.file_change_prompt_open = false;
+                }
+                Some("ignore") => {
+                    self.last_file_mtime = Self::read_file_mtime(&self.file_path);
+                    self.file_change_prompt_open = false;
+                }
+                Some("disable") => {
+                    self.settings.watch_file_changes = false;
+                    self.file_change_disabled = true;
+                    self.file_change_prompt_open = false;
+                }
+                _ => {}
+            }
         }
 
         if self.find_state.open {
@@ -1229,6 +1830,7 @@ impl eframe::App for ScratchpadApp {
                             self.settings.word_wrap,
                             wrap_width,
                             font_id.clone(),
+                            self.settings.highlight_mode,
                         );
                         let text_edit = egui::TextEdit::multiline(&mut self.text)
                             .id(editor_id)
@@ -1369,6 +1971,85 @@ fn save_config_settings(settings: &AppSettings) -> std::io::Result<()> {
     let contents = ron::ser::to_string_pretty(settings, pretty)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     std::fs::write(path, contents)
+}
+
+struct UpdateCheckResult {
+    available: Option<String>,
+    url: Option<String>,
+    error: Option<String>,
+}
+
+fn check_for_update() -> UpdateCheckResult {
+    let url = "https://api.github.com/repos/samseyller/scratch-pad/releases/latest";
+    let response = ureq::get(url)
+        .set("User-Agent", "scratchpad")
+        .call();
+
+    let response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, response)) => {
+            let status = response.status_text().to_string();
+            return UpdateCheckResult {
+                available: None,
+                url: None,
+                error: Some(format!("Update check failed: {code} {status}")),
+            };
+        }
+        Err(ureq::Error::Transport(err)) => {
+            return UpdateCheckResult {
+                available: None,
+                url: None,
+                error: Some(format!("Update check failed: {err}")),
+            };
+        }
+    };
+
+    let value = match response.into_json::<Value>() {
+        Ok(value) => value,
+        Err(err) => {
+            return UpdateCheckResult {
+                available: None,
+                url: None,
+                error: Some(format!("Update check failed: {err}")),
+            };
+        }
+    };
+
+    let tag = value
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim_start_matches('v')
+        .to_string();
+
+    let Ok(latest) = Version::parse(&tag) else {
+        return UpdateCheckResult {
+            available: None,
+            url: None,
+            error: Some("Update check failed.".to_string()),
+        };
+    };
+    let Ok(current) = Version::parse(env!("CARGO_PKG_VERSION")) else {
+        return UpdateCheckResult {
+            available: None,
+            url: None,
+            error: None,
+        };
+    };
+
+    if latest > current {
+        UpdateCheckResult {
+            available: Some(latest.to_string()),
+            url: value.get("html_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            error: None,
+        }
+    } else {
+        UpdateCheckResult {
+            available: None,
+            url: None,
+            error: None,
+        }
+    }
 }
 
 fn write_all_text(path: &Path, contents: &str) -> std::io::Result<()> {
