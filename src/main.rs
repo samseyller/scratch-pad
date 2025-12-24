@@ -49,6 +49,12 @@ impl FontFamilySetting {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineEnding {
+    Lf,
+    CrLf,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct AppSettings {
@@ -132,11 +138,17 @@ struct ScratchpadApp {
     /// Text at last successful save/open. If text != snapshot => "dirty".
     saved_snapshot: String,
 
+    /// Original line-ending style of the file on disk.
+    line_ending: LineEnding,
+
     /// If set, show the "Unsaved changes" dialog and then run this action.
     pending_action: Option<PendingAction>,
 
     /// Request focus for the editor on the next frame (after New/Open).
     request_editor_focus: bool,
+
+    /// Clear editor selection/state on the next frame (after New/Open).
+    reset_editor_state: bool,
 
     /// Show last error in a small status bar.
     last_error: Option<String>,
@@ -154,8 +166,10 @@ impl Default for ScratchpadApp {
             text: String::new(),
             file_path: None,
             saved_snapshot: String::new(),
+            line_ending: LineEnding::Lf,
             pending_action: None,
             request_editor_focus: true,
+            reset_editor_state: false,
             last_error: None,
             settings: AppSettings::default(),
             find_state: FindState::default(),
@@ -189,13 +203,30 @@ impl ScratchpadApp {
         self.last_error = None;
     }
 
+    fn normalize_line_endings(contents: &str) -> (String, LineEnding) {
+        if contents.contains("\r\n") {
+            (contents.replace("\r\n", "\n"), LineEnding::CrLf)
+        } else {
+            (contents.to_owned(), LineEnding::Lf)
+        }
+    }
+
+    fn apply_line_ending(&self, contents: &str) -> String {
+        match self.line_ending {
+            LineEnding::Lf => contents.to_owned(),
+            LineEnding::CrLf => contents.replace("\n", "\r\n"),
+        }
+    }
+
     /// Start a new, empty document.
     fn do_new_file(&mut self) {
         self.text.clear();
         self.saved_snapshot.clear();
         self.file_path = None;
+        self.line_ending = LineEnding::Lf;
         self.clear_error();
         self.request_editor_focus = true;
+        self.reset_editor_state = true;
     }
 
     /// Open a file chosen by the user and load it into the buffer.
@@ -214,10 +245,13 @@ impl ScratchpadApp {
 
         match fs::read_to_string(&path) {
             Ok(contents) => {
-                self.text = contents;
+                let (normalized, line_ending) = Self::normalize_line_endings(&contents);
+                self.text = normalized;
                 self.saved_snapshot = self.text.clone();
+                self.line_ending = line_ending;
                 self.file_path = Some(path);
                 self.request_editor_focus = true;
+                self.reset_editor_state = true;
             }
             Err(e) => self.set_error(format!("Failed to open file: {e}")),
         }
@@ -229,10 +263,13 @@ impl ScratchpadApp {
 
         match fs::read_to_string(&path) {
             Ok(contents) => {
-                self.text = contents;
+                let (normalized, line_ending) = Self::normalize_line_endings(&contents);
+                self.text = normalized;
                 self.saved_snapshot = self.text.clone();
+                self.line_ending = line_ending;
                 self.file_path = Some(path);
                 self.request_editor_focus = true;
+                self.reset_editor_state = true;
             }
             Err(e) => self.set_error(format!("Failed to open file: {e}")),
         }
@@ -257,7 +294,8 @@ impl ScratchpadApp {
             return;
         };
 
-        if let Err(e) = write_all_text(&path, &self.text) {
+        let contents = self.apply_line_ending(&self.text);
+        if let Err(e) = write_all_text(&path, &contents) {
             self.set_error(format!("Failed to save file: {e}"));
             return;
         }
@@ -281,7 +319,8 @@ impl ScratchpadApp {
             return;
         };
 
-        if let Err(e) = write_all_text(&path, &self.text) {
+        let contents = self.apply_line_ending(&self.text);
+        if let Err(e) = write_all_text(&path, &contents) {
             self.set_error(format!("Failed to save file: {e}"));
             return;
         }
@@ -344,7 +383,11 @@ impl ScratchpadApp {
 
         let chars = self.text.chars().count();
 
-        format!("{name}{dirty}  |  Lines: {lines}  Chars: {chars}")
+        let line_ending = match self.line_ending {
+            LineEnding::Lf => "LF",
+            LineEnding::CrLf => "CRLF",
+        };
+        format!("{name}{dirty}  |  Lines: {lines}  Chars: {chars}  |  {line_ending}")
     }
 
     fn apply_font_settings(&self, ctx: &egui::Context) {
@@ -876,6 +919,10 @@ impl eframe::App for ScratchpadApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             // Stable ID helps keep focus/state consistent.
             let editor_id = egui::Id::new("editor");
+            if self.reset_editor_state {
+                egui::TextEdit::store_state(ctx, editor_id, Default::default());
+                self.reset_editor_state = false;
+            }
             let show_line_numbers = self.settings.show_line_numbers;
 
             let font_id =
