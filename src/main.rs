@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 /// Minimal Notepad-like app (single-file editor) using eframe/egui + rfd dialogs.
 ///
@@ -26,8 +27,38 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Scratchpad",
         native_options,
-        Box::new(|_cc| Box::new(ScratchpadApp::default())),
+        Box::new(|cc| Box::new(ScratchpadApp::new(cc))),
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum FontFamilySetting {
+    Proportional,
+    Monospace,
+}
+
+impl FontFamilySetting {
+    fn to_egui(self) -> egui::FontFamily {
+        match self {
+            FontFamilySetting::Proportional => egui::FontFamily::Proportional,
+            FontFamilySetting::Monospace => egui::FontFamily::Monospace,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AppSettings {
+    font_size: f32,
+    font_family: FontFamilySetting,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            font_size: 16.0,
+            font_family: FontFamilySetting::Monospace,
+        }
+    }
 }
 
 /// If the user has unsaved changes and tries to do something destructive,
@@ -62,6 +93,9 @@ struct ScratchpadApp {
 
     /// Show last error in a small status bar.
     last_error: Option<String>,
+
+    /// UI settings that should persist between runs.
+    settings: AppSettings,
 }
 
 impl Default for ScratchpadApp {
@@ -73,11 +107,22 @@ impl Default for ScratchpadApp {
             pending_action: None,
             request_editor_focus: true,
             last_error: None,
+            settings: AppSettings::default(),
         }
     }
 }
 
 impl ScratchpadApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut app = Self::default();
+        if let Some(storage) = cc.storage {
+            if let Some(settings) = eframe::get_value(storage, "scratchpad_settings") {
+                app.settings = settings;
+            }
+        }
+        app
+    }
+
     /// Are there unsaved edits?
     fn is_dirty(&self) -> bool {
         self.text != self.saved_snapshot
@@ -250,10 +295,24 @@ impl ScratchpadApp {
 
         format!("{name}{dirty}  |  Lines: {lines}  Chars: {chars}")
     }
+
+    fn apply_font_settings(&self, ctx: &egui::Context) {
+        let mut style = (*ctx.style()).clone();
+        for (_text_style, font_id) in style.text_styles.iter_mut() {
+            font_id.size = self.settings.font_size;
+            font_id.family = self.settings.font_family.to_egui();
+        }
+        ctx.set_style(style);
+    }
 }
 
 impl eframe::App for ScratchpadApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "scratchpad_settings", &self.settings);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_font_settings(ctx);
         // ─────────────────────────────────────────────────────────────────────
         // Top menu bar
         // ─────────────────────────────────────────────────────────────────────
@@ -299,6 +358,36 @@ impl eframe::App for ScratchpadApp {
                     // egui's TextEdit handles Ctrl+C/V/X/A on native platforms.
                     // These menu items are mostly for familiarity.
                     ui.label("Use Ctrl+C / Ctrl+V / Ctrl+X / Ctrl+A in the editor.");
+                });
+
+                ui.menu_button("View", |ui| {
+                    let mut changed = false;
+
+                    ui.label("Font size");
+                    changed |= ui
+                        .add(egui::Slider::new(&mut self.settings.font_size, 10.0..=24.0))
+                        .changed();
+
+                    ui.separator();
+                    ui.label("Font family");
+                    changed |= ui
+                        .radio_value(
+                            &mut self.settings.font_family,
+                            FontFamilySetting::Proportional,
+                            "Proportional",
+                        )
+                        .changed();
+                    changed |= ui
+                        .radio_value(
+                            &mut self.settings.font_family,
+                            FontFamilySetting::Monospace,
+                            "Monospace",
+                        )
+                        .changed();
+
+                    if changed {
+                        self.apply_font_settings(ctx);
+                    }
                 });
 
                 // Right-side: show current full path (or Untitled)
