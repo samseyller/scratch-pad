@@ -32,10 +32,11 @@ fn main() -> eframe::Result<()> {
 
 /// If the user has unsaved changes and tries to do something destructive,
 /// we defer that action until they answer the prompt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PendingAction {
     NewFile,
     OpenFile,
+    OpenPath(PathBuf),
     Exit,
 }
 
@@ -114,6 +115,21 @@ impl ScratchpadApp {
             // User canceled.
             return;
         };
+
+        match fs::read_to_string(&path) {
+            Ok(contents) => {
+                self.text = contents;
+                self.saved_snapshot = self.text.clone();
+                self.file_path = Some(path);
+                self.request_editor_focus = true;
+            }
+            Err(e) => self.set_error(format!("Failed to open file: {e}")),
+        }
+    }
+
+    /// Open a specific file path (e.g. from drag-and-drop).
+    fn do_open_path(&mut self, path: PathBuf) {
+        self.clear_error();
 
         match fs::read_to_string(&path) {
             Ok(contents) => {
@@ -205,6 +221,7 @@ impl ScratchpadApp {
         match action {
             PendingAction::NewFile => self.do_new_file(),
             PendingAction::OpenFile => self.do_open_file(),
+            PendingAction::OpenPath(path) => self.do_open_path(path),
             PendingAction::Exit => {
                 // Closing happens in update() via ViewportCommand::Close.
                 self.pending_action = Some(PendingAction::Exit);
@@ -337,13 +354,27 @@ impl eframe::App for ScratchpadApp {
             }
         });
 
+        // Handle file drag-and-drop.
+        let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+
+        if let Some(path) = dropped_paths.into_iter().next() {
+            self.maybe_defer_or_run(PendingAction::OpenPath(path));
+        }
+
         // ─────────────────────────────────────────────────────────────────────
         // Unsaved changes modal
         // ─────────────────────────────────────────────────────────────────────
-        if let Some(action) = self.pending_action {
+        if let Some(action) = self.pending_action.clone() {
+            let is_exit = matches!(action, PendingAction::Exit);
             // If the pending action is Exit and we are not dirty, close immediately.
             // (This can happen if the action was queued but changes were saved.)
-            if action == PendingAction::Exit && !self.is_dirty() {
+            if is_exit && !self.is_dirty() {
                 self.pending_action = None;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
@@ -365,10 +396,10 @@ impl eframe::App for ScratchpadApp {
                             // Proceed only if the save actually succeeded (i.e., now clean).
                             if !self.is_dirty() {
                                 self.pending_action = None;
-                                if action == PendingAction::Exit {
+                                if is_exit {
                                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                 } else {
-                                    self.run_action(action);
+                                    self.run_action(action.clone());
                                     self.pending_action = None;
                                 }
                             }
@@ -381,10 +412,10 @@ impl eframe::App for ScratchpadApp {
                             // Discard by reverting the buffer to the last saved snapshot.
                             self.text = self.saved_snapshot.clone();
 
-                            if action == PendingAction::Exit {
+                            if is_exit {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             } else {
-                                self.run_action(action);
+                                self.run_action(action.clone());
                                 self.pending_action = None;
                             }
                         }
