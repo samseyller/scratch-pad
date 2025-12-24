@@ -47,9 +47,11 @@ impl FontFamilySetting {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 struct AppSettings {
     font_size: f32,
     font_family: FontFamilySetting,
+    show_line_numbers: bool,
 }
 
 impl Default for AppSettings {
@@ -57,6 +59,7 @@ impl Default for AppSettings {
         Self {
             font_size: 16.0,
             font_family: FontFamilySetting::Monospace,
+            show_line_numbers: true,
         }
     }
 }
@@ -385,6 +388,11 @@ impl eframe::App for ScratchpadApp {
                         )
                         .changed();
 
+                    ui.separator();
+                    changed |= ui
+                        .checkbox(&mut self.settings.show_line_numbers, "Line numbers")
+                        .changed();
+
                     if changed {
                         self.apply_font_settings(ctx);
                     }
@@ -421,14 +429,108 @@ impl eframe::App for ScratchpadApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             // Stable ID helps keep focus/state consistent.
             let editor_id = ui.make_persistent_id("editor");
+            let show_line_numbers = self.settings.show_line_numbers;
 
-            let text_edit = egui::TextEdit::multiline(&mut self.text)
-                .id(editor_id)
-                .desired_width(f32::INFINITY);
+            let font_id =
+                egui::FontId::new(self.settings.font_size, self.settings.font_family.to_egui());
+            let line_number_color = ui.visuals().weak_text_color();
+
+            let lines: Vec<String> = if show_line_numbers {
+                if self.text.is_empty() {
+                    vec![String::new()]
+                } else {
+                    self.text.split('\n').map(str::to_owned).collect()
+                }
+            } else {
+                Vec::new()
+            };
 
             let response = egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show(ui, |ui| ui.add_sized(ui.available_size(), text_edit))
+                .show(ui, |ui| {
+                    let available_width = ui.available_width();
+                    let gutter_width = if show_line_numbers {
+                        let total_lines = lines.len().max(1);
+                        let digits = total_lines.to_string().len();
+                        let sample = "9".repeat(digits);
+                        let width = ui
+                            .fonts(|f| {
+                                f.layout_no_wrap(sample, font_id.clone(), line_number_color)
+                            })
+                            .size()
+                            .x;
+                        width + 8.0
+                    } else {
+                        0.0
+                    };
+
+                    let text_width = if show_line_numbers {
+                        (available_width - gutter_width - ui.spacing().item_spacing.x).max(64.0)
+                    } else {
+                        available_width
+                    };
+
+                    let text_margin_x = 4.0;
+                    let line_number_offset_y = -8.0;
+                    let wrap_width = (text_width - 2.0 * text_margin_x).max(1.0);
+
+                    ui.horizontal(|ui| {
+                        if show_line_numbers {
+                            let line_height = ui
+                                .fonts(|f| {
+                                    f.layout_no_wrap("0".to_owned(), font_id.clone(), line_number_color)
+                                })
+                                .size()
+                                .y;
+
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(gutter_width, 0.0),
+                                egui::Layout::top_down(egui::Align::Max),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    ui.add_space(line_number_offset_y);
+                                    for (idx, line) in lines.iter().enumerate() {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new((idx + 1).to_string())
+                                                    .color(line_number_color),
+                                            )
+                                            .wrap(false),
+                                        );
+
+                                        let line_text = if line.is_empty() { " " } else { line };
+                                        let galley = ui.fonts(|f| {
+                                            let mut job = egui::text::LayoutJob::simple(
+                                                line_text.to_owned(),
+                                                font_id.clone(),
+                                                line_number_color,
+                                                wrap_width,
+                                            );
+                                            job.wrap.max_width = wrap_width;
+                                            f.layout_job(job)
+                                        });
+                                        let first_height = galley
+                                            .rows
+                                            .first()
+                                            .map(|row| row.height())
+                                            .unwrap_or(line_height);
+                                        let extra = (galley.size().y - first_height).max(0.0);
+                                        if extra > 0.0 {
+                                            ui.add_space(extra);
+                                        }
+                                    }
+                                },
+                            );
+                        }
+
+                        let text_edit = egui::TextEdit::multiline(&mut self.text)
+                            .id(editor_id)
+                            .desired_width(text_width);
+
+                        ui.add_sized([text_width, ui.available_height()], text_edit)
+                    })
+                    .inner
+                })
                 .inner;
 
             // Grab focus after New/Open.
