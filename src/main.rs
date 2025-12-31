@@ -121,6 +121,7 @@ struct FindState {
     highlight_all: bool,
     last_result: Option<String>,
     scroll_to_match: bool,
+    request_focus: bool,
 }
 
 impl Default for FindState {
@@ -135,6 +136,7 @@ impl Default for FindState {
             highlight_all: false,
             last_result: None,
             scroll_to_match: false,
+            request_focus: false,
         }
     }
 }
@@ -1235,10 +1237,12 @@ impl eframe::App for ScratchpadApp {
         if open_find {
             self.find_state.open = true;
             self.find_state.show_replace = false;
+            self.find_state.request_focus = true;
         }
         if open_replace {
             self.find_state.open = true;
             self.find_state.show_replace = true;
+            self.find_state.request_focus = true;
         }
         self.check_external_change();
         let mut hotkey_new = false;
@@ -1409,11 +1413,13 @@ impl eframe::App for ScratchpadApp {
                         ui.close_menu();
                         self.find_state.open = true;
                         self.find_state.show_replace = false;
+                        self.find_state.request_focus = true;
                     }
                     if ui.button("Find and Replace (Ctrl+R)").clicked() {
                         ui.close_menu();
                         self.find_state.open = true;
                         self.find_state.show_replace = true;
+                        self.find_state.request_focus = true;
                     }
 
                     ui.separator();
@@ -1631,12 +1637,16 @@ impl eframe::App for ScratchpadApp {
                     let mut find_changed = false;
                     ui.horizontal(|ui| {
                         ui.label("Find");
-                        find_changed |= ui
-                            .add(
-                                egui::TextEdit::singleline(&mut self.find_state.query)
-                                    .desired_width(240.0),
-                            )
-                            .changed();
+                        let find_response = ui.add(
+                            egui::TextEdit::singleline(&mut self.find_state.query)
+                                .desired_width(240.0)
+                                .id(egui::Id::new("find_input")),
+                        );
+                        if self.find_state.request_focus {
+                            find_response.request_focus();
+                            self.find_state.request_focus = false;
+                        }
+                        find_changed |= find_response.changed();
                     });
 
                     if self.find_state.show_replace {
