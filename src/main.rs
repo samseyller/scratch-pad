@@ -986,6 +986,21 @@ impl ScratchpadApp {
             })
     }
 
+    fn populate_find_from_selection(&mut self, ctx: &egui::Context) {
+        let Some((start, end)) = self.current_selection_char_range(ctx) else {
+            return;
+        };
+        if start >= end {
+            return;
+        }
+        let selected = egui::text_selection::text_cursor_state::slice_char_range(
+            &self.text,
+            start..end,
+        );
+        self.find_state.query = selected.to_string();
+        self.find_state.highlight_all = false;
+    }
+
     fn select_match(&mut self, ctx: &egui::Context, start_char: usize, end_char: usize) {
         let editor_id = egui::Id::new("editor");
         if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) {
@@ -1237,11 +1252,13 @@ impl eframe::App for ScratchpadApp {
         if open_find {
             self.find_state.open = true;
             self.find_state.show_replace = false;
+            self.populate_find_from_selection(ctx);
             self.find_state.request_focus = true;
         }
         if open_replace {
             self.find_state.open = true;
             self.find_state.show_replace = true;
+            self.populate_find_from_selection(ctx);
             self.find_state.request_focus = true;
         }
         self.check_external_change();
