@@ -120,6 +120,7 @@ struct FindState {
     case_sensitive: bool,
     highlight_all: bool,
     last_result: Option<String>,
+    scroll_to_match: bool,
 }
 
 impl Default for FindState {
@@ -133,6 +134,7 @@ impl Default for FindState {
             case_sensitive: false,
             highlight_all: false,
             last_result: None,
+            scroll_to_match: false,
         }
     }
 }
@@ -1053,6 +1055,7 @@ impl ScratchpadApp {
         let idx = self.find_next_match_index(ctx, &matches);
         let m = matches[idx];
         self.select_match(ctx, m.start_char, m.end_char);
+        self.find_state.scroll_to_match = true;
         self.set_find_result(format!("Match {}/{}", idx + 1, matches.len()));
     }
 
@@ -1072,6 +1075,7 @@ impl ScratchpadApp {
         let idx = self.find_prev_match_index(ctx, &matches);
         let m = matches[idx];
         self.select_match(ctx, m.start_char, m.end_char);
+        self.find_state.scroll_to_match = true;
         self.set_find_result(format!("Match {}/{}", idx + 1, matches.len()));
     }
 
@@ -1091,6 +1095,7 @@ impl ScratchpadApp {
         self.find_state.highlight_all = true;
         let m = matches[0];
         self.select_match(ctx, m.start_char, m.end_char);
+        self.find_state.scroll_to_match = true;
         self.set_find_result(format!("Found {} matches", matches.len()));
     }
 
@@ -1128,6 +1133,7 @@ impl ScratchpadApp {
         self.text.replace_range(m.start_byte..m.end_byte, &replacement);
         let new_end = m.start_char + replacement.chars().count();
         self.select_match(ctx, m.start_char, new_end);
+        self.find_state.scroll_to_match = true;
         self.set_find_result(format!("Replaced {}/{}", idx + 1, matches.len()));
     }
 
@@ -1845,6 +1851,25 @@ impl eframe::App for ScratchpadApp {
                                 |ui| text_edit.show(ui),
                             )
                             .inner;
+
+                        if self.find_state.scroll_to_match {
+                            if let Some(cursor_range) = output.cursor_range.clone() {
+                                let row_height = output
+                                    .galley
+                                    .rows
+                                    .first()
+                                    .map(|row| row.height())
+                                    .unwrap_or(self.settings.font_size);
+                                let cursor_rect = egui::text_selection::text_cursor_state::cursor_rect(
+                                    output.galley_pos,
+                                    &output.galley,
+                                    &cursor_range.primary,
+                                    row_height,
+                                );
+                                ui.scroll_to_rect(cursor_rect, None);
+                            }
+                            self.find_state.scroll_to_match = false;
+                        }
 
                         if self.find_state.highlight_all {
                             self.paint_find_highlights(ui, &output);
