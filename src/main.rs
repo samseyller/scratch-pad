@@ -2052,7 +2052,10 @@ fn check_for_update() -> UpdateCheckResult {
             return UpdateCheckResult {
                 available: None,
                 url: None,
-                error: Some(format!("Update check failed: {err}")),
+                error: Some(format!(
+                    "Update check failed: {}",
+                    short_transport_error(&err)
+                )),
             };
         }
     };
@@ -2103,6 +2106,14 @@ fn check_for_update() -> UpdateCheckResult {
             error: None,
         }
     }
+}
+
+fn short_transport_error(err: &ureq::Transport) -> String {
+    let mut message = err.kind().to_string();
+    if let Some(detail) = err.message() {
+        message = format!("{message}: {detail}");
+    }
+    message
 }
 
 fn write_all_text(path: &Path, contents: &str) -> std::io::Result<()> {
