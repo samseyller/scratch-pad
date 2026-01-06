@@ -1869,6 +1869,7 @@ impl eframe::App for ScratchpadApp {
                             .id(editor_id)
                             .font(font_id.clone())
                             .layouter(&mut layouter)
+                            .lock_focus(true)
                             .desired_width(text_width);
 
                         let output = ui
