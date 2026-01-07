@@ -294,8 +294,15 @@ impl ScratchpadApp {
         self.clear_error();
 
         let picked = rfd::FileDialog::new()
-            .add_filter("Text", &["txt", "log", "md", "rs", "toml"])
-            .add_filter("All files", &["*"])
+            .add_filter("Text Files", &["txt", "log", "md", "rst", "adoc"])
+            .add_filter("Config & Data", &["json", "yaml", "yml", "toml", "ini", "cfg", "ron"])
+            .add_filter(
+                "Source Code",
+                &["rs", "c", "cpp", "cs", "java", "py", "js", "ts", "go"],
+            )
+            .add_filter("Web Files", &["html", "css", "js", "ts"])
+            .add_filter("Structured Data", &["csv", "xml"])
+            .add_filter("All Files", &["*"])
             .pick_file();
 
         let Some(path) = picked else {
