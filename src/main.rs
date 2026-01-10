@@ -159,6 +159,14 @@ enum PendingAction {
     Exit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorAction {
+    Copy,
+    Cut,
+    Paste,
+    SelectAll,
+}
+
 /// Application state: one text buffer + some file metadata.
 ///
 /// We track a `saved_snapshot` so we can detect unsaved changes without any
@@ -187,6 +195,12 @@ struct ScratchpadApp {
 
     /// Clear editor selection/state on the next frame (after New/Open).
     reset_editor_state: bool,
+
+    /// Right-click editor context menu state.
+    editor_context_menu_open: bool,
+    editor_context_menu_pos: Option<egui::Pos2>,
+    editor_context_menu_selection: Option<egui::text::CCursorRange>,
+    pending_editor_action: Option<EditorAction>,
 
     /// Show last error in a small status bar.
     last_error: Option<String>,
@@ -218,6 +232,10 @@ impl Default for ScratchpadApp {
             pending_action: None,
             request_editor_focus: true,
             reset_editor_state: false,
+            editor_context_menu_open: false,
+            editor_context_menu_pos: None,
+            editor_context_menu_selection: None,
+            pending_editor_action: None,
             last_error: None,
             settings: AppSettings::default(),
             find_state: FindState::default(),
@@ -1236,6 +1254,98 @@ impl ScratchpadApp {
             Err(e) => self.set_error(format!("Clipboard paste failed: {e}")),
         }
     }
+
+    fn editor_action_menu(&mut self, ui: &mut egui::Ui) -> Option<EditorAction> {
+        if ui.button("Copy (Ctrl+C)").clicked() {
+            return Some(EditorAction::Copy);
+        }
+
+        if ui.button("Cut (Ctrl+X)").clicked() {
+            return Some(EditorAction::Cut);
+        }
+
+        if ui.button("Paste (Ctrl+V)").clicked() {
+            return Some(EditorAction::Paste);
+        }
+
+        if ui.button("Select All (Ctrl+A)").clicked() {
+            return Some(EditorAction::SelectAll);
+        }
+
+        None
+    }
+
+    fn perform_editor_action(&mut self, ctx: &egui::Context, action: EditorAction) {
+        match action {
+            EditorAction::Copy => self.send_editor_event(ctx, egui::Event::Copy),
+            EditorAction::Cut => self.send_editor_event(ctx, egui::Event::Cut),
+            EditorAction::Paste => self.paste_from_clipboard(ctx),
+            EditorAction::SelectAll => self.send_editor_event(
+                ctx,
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+            ),
+        }
+    }
+
+    fn show_editor_context_menu(&mut self, ctx: &egui::Context) {
+        if !self.editor_context_menu_open {
+            return;
+        }
+
+        let Some(pos) = self.editor_context_menu_pos else {
+            self.editor_context_menu_open = false;
+            self.editor_context_menu_selection = None;
+            return;
+        };
+
+        let mut close_menu = false;
+        let area_response = egui::Area::new(egui::Id::new("editor_context_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .interactable(true)
+            .sense(egui::Sense::hover())
+            .show(ctx, |ui| {
+                egui::Frame::menu(ui.style())
+                    .show(ui, |ui| {
+                        ui.set_max_width(ui.spacing().menu_width);
+                        ui.with_layout(
+                            egui::Layout::top_down_justified(egui::Align::LEFT),
+                            |ui| {
+                                if let Some(action) = self.editor_action_menu(ui) {
+                                    self.pending_editor_action = Some(action);
+                                    close_menu = true;
+                                }
+                            },
+                        );
+                    })
+                    .response
+            });
+
+        let menu_rect = area_response.response.rect;
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close_menu = true;
+        }
+
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            if let Some(pointer_pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                if !menu_rect.contains(pointer_pos) {
+                    close_menu = true;
+                }
+            }
+        }
+
+        if close_menu {
+            self.editor_context_menu_open = false;
+            self.editor_context_menu_pos = None;
+            self.editor_context_menu_selection = None;
+        }
+    }
 }
 
 impl eframe::App for ScratchpadApp {
@@ -1246,6 +1356,9 @@ impl eframe::App for ScratchpadApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_font_settings(ctx);
         self.poll_update_check();
+        if let Some(action) = self.pending_editor_action.take() {
+            self.perform_editor_action(ctx, action);
+        }
         let mut open_find = false;
         let mut open_replace = false;
         ctx.input_mut(|i| {
@@ -1403,33 +1516,9 @@ impl eframe::App for ScratchpadApp {
                 });
 
                 ui.menu_button("Edit", |ui| {
-                    if ui.button("Copy (Ctrl+C)").clicked() {
+                    if let Some(action) = self.editor_action_menu(ui) {
+                        self.perform_editor_action(ctx, action);
                         ui.close_menu();
-                        self.send_editor_event(ctx, egui::Event::Copy);
-                    }
-
-                    if ui.button("Cut (Ctrl+X)").clicked() {
-                        ui.close_menu();
-                        self.send_editor_event(ctx, egui::Event::Cut);
-                    }
-
-                    if ui.button("Paste (Ctrl+V)").clicked() {
-                        ui.close_menu();
-                        self.paste_from_clipboard(ctx);
-                    }
-
-                    if ui.button("Select All (Ctrl+A)").clicked() {
-                        ui.close_menu();
-                        self.send_editor_event(
-                            ctx,
-                            egui::Event::Key {
-                                key: egui::Key::A,
-                                physical_key: None,
-                                pressed: true,
-                                repeat: false,
-                                modifiers: egui::Modifiers::COMMAND,
-                            },
-                        );
                     }
 
                     ui.separator();
@@ -1762,6 +1851,8 @@ impl eframe::App for ScratchpadApp {
                 egui::TextEdit::store_state(ctx, editor_id, Default::default());
                 self.reset_editor_state = false;
             }
+            let previous_selection =
+                egui::TextEdit::load_state(ctx, editor_id).and_then(|state| state.cursor.char_range());
             let show_line_numbers = self.settings.show_line_numbers;
 
             let font_id =
@@ -1910,6 +2001,26 @@ impl eframe::App for ScratchpadApp {
                             self.paint_find_highlights(ui, &output);
                         }
 
+                        if output.response.secondary_clicked() {
+                            let pos = output
+                                .response
+                                .interact_pointer_pos()
+                                .or_else(|| ctx.input(|i| i.pointer.interact_pos()));
+                            if pos.is_some() {
+                                self.editor_context_menu_open = true;
+                                self.editor_context_menu_pos = pos;
+                                self.editor_context_menu_selection = previous_selection;
+                            }
+                        }
+
+                        if self.editor_context_menu_open {
+                            if let Some(range) = self.editor_context_menu_selection {
+                                let mut state = output.state.clone();
+                                state.cursor.set_char_range(Some(range));
+                                state.store(ctx, editor_id);
+                            }
+                        }
+
                         output.response.clone()
                     })
                     .inner
@@ -1927,6 +2038,8 @@ impl eframe::App for ScratchpadApp {
                 self.clear_error();
             }
         });
+
+        self.show_editor_context_menu(ctx);
 
         // Handle file drag-and-drop.
         let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
