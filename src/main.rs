@@ -69,6 +69,23 @@ enum LineEnding {
     CrLf,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextEncoding {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+}
+
+impl TextEncoding {
+    fn label(self) -> &'static str {
+        match self {
+            TextEncoding::Utf8 => "UTF-8",
+            TextEncoding::Utf16Le => "UTF-16 LE",
+            TextEncoding::Utf16Be => "UTF-16 BE",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum HighlightMode {
     Off,
@@ -184,6 +201,9 @@ struct ScratchpadApp {
     /// Original line-ending style of the file on disk.
     line_ending: LineEnding,
 
+    /// Current encoding for load/save.
+    encoding: TextEncoding,
+
     /// Last known modified timestamp for the opened file.
     last_file_mtime: Option<SystemTime>,
 
@@ -228,6 +248,7 @@ impl Default for ScratchpadApp {
             file_path: None,
             saved_snapshot: String::new(),
             line_ending: LineEnding::Lf,
+            encoding: TextEncoding::Utf8,
             last_file_mtime: None,
             pending_action: None,
             request_editor_focus: true,
@@ -295,6 +316,100 @@ impl ScratchpadApp {
         }
     }
 
+    fn decode_bytes(bytes: &[u8], encoding: TextEncoding) -> Result<String, String> {
+        match encoding {
+            TextEncoding::Utf8 => String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string()),
+            TextEncoding::Utf16Le => {
+                if bytes.len() % 2 != 0 {
+                    return Err("UTF-16 LE data has odd length.".to_string());
+                }
+                let mut units = Vec::with_capacity(bytes.len() / 2);
+                for chunk in bytes.chunks_exact(2) {
+                    units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+                }
+                String::from_utf16(&units).map_err(|e| e.to_string())
+            }
+            TextEncoding::Utf16Be => {
+                if bytes.len() % 2 != 0 {
+                    return Err("UTF-16 BE data has odd length.".to_string());
+                }
+                let mut units = Vec::with_capacity(bytes.len() / 2);
+                for chunk in bytes.chunks_exact(2) {
+                    units.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+                }
+                String::from_utf16(&units).map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    fn detect_encoding(bytes: &[u8]) -> (TextEncoding, usize) {
+        if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            return (TextEncoding::Utf8, 3);
+        }
+        if bytes.starts_with(&[0xFF, 0xFE]) {
+            return (TextEncoding::Utf16Le, 2);
+        }
+        if bytes.starts_with(&[0xFE, 0xFF]) {
+            return (TextEncoding::Utf16Be, 2);
+        }
+
+        let mut even_zeros = 0usize;
+        let mut odd_zeros = 0usize;
+        for (idx, byte) in bytes.iter().enumerate() {
+            if *byte == 0 {
+                if idx % 2 == 0 {
+                    even_zeros += 1;
+                } else {
+                    odd_zeros += 1;
+                }
+            }
+        }
+
+        if odd_zeros > even_zeros * 2 {
+            (TextEncoding::Utf16Le, 0)
+        } else if even_zeros > odd_zeros * 2 {
+            (TextEncoding::Utf16Be, 0)
+        } else {
+            (TextEncoding::Utf8, 0)
+        }
+    }
+
+    fn read_text_with_encoding(path: &Path) -> Result<(String, LineEnding, TextEncoding), String> {
+        let bytes = fs::read(path).map_err(|e| e.to_string())?;
+        let (encoding, bom_len) = Self::detect_encoding(&bytes);
+        let text = Self::decode_bytes(&bytes[bom_len..], encoding)?;
+        let (normalized, line_ending) = Self::normalize_line_endings(&text);
+        Ok((normalized, line_ending, encoding))
+    }
+
+    fn write_text_with_encoding(
+        &self,
+        path: &Path,
+        contents: &str,
+        encoding: TextEncoding,
+    ) -> std::io::Result<()> {
+        let contents = self.apply_line_ending(contents);
+        match encoding {
+            TextEncoding::Utf8 => fs::write(path, contents.as_bytes()),
+            TextEncoding::Utf16Le => {
+                let mut bytes = Vec::with_capacity(contents.len() * 2 + 2);
+                bytes.extend_from_slice(&[0xFF, 0xFE]);
+                for unit in contents.encode_utf16() {
+                    bytes.extend_from_slice(&unit.to_le_bytes());
+                }
+                fs::write(path, bytes)
+            }
+            TextEncoding::Utf16Be => {
+                let mut bytes = Vec::with_capacity(contents.len() * 2 + 2);
+                bytes.extend_from_slice(&[0xFE, 0xFF]);
+                for unit in contents.encode_utf16() {
+                    bytes.extend_from_slice(&unit.to_be_bytes());
+                }
+                fs::write(path, bytes)
+            }
+        }
+    }
+
     /// Start a new, empty document.
     fn do_new_file(&mut self) {
         self.text.clear();
@@ -318,12 +433,12 @@ impl ScratchpadApp {
             return;
         };
 
-        match fs::read_to_string(&path) {
-            Ok(contents) => {
-                let (normalized, line_ending) = Self::normalize_line_endings(&contents);
+        match Self::read_text_with_encoding(&path) {
+            Ok((normalized, line_ending, encoding)) => {
                 self.text = normalized;
                 self.saved_snapshot = self.text.clone();
                 self.line_ending = line_ending;
+                self.encoding = encoding;
                 self.push_recent(&path);
                 self.file_path = Some(path);
                 self.last_file_mtime = Self::read_file_mtime(&self.file_path);
@@ -338,12 +453,12 @@ impl ScratchpadApp {
     fn do_open_path(&mut self, path: PathBuf) {
         self.clear_error();
 
-        match fs::read_to_string(&path) {
-            Ok(contents) => {
-                let (normalized, line_ending) = Self::normalize_line_endings(&contents);
+        match Self::read_text_with_encoding(&path) {
+            Ok((normalized, line_ending, encoding)) => {
                 self.text = normalized;
                 self.saved_snapshot = self.text.clone();
                 self.line_ending = line_ending;
+                self.encoding = encoding;
                 self.push_recent(&path);
                 self.file_path = Some(path);
                 self.last_file_mtime = Self::read_file_mtime(&self.file_path);
@@ -400,8 +515,7 @@ impl ScratchpadApp {
             return;
         };
 
-        let contents = self.apply_line_ending(&self.text);
-        if let Err(e) = write_all_text(&path, &contents) {
+        if let Err(e) = self.write_text_with_encoding(&path, &self.text, self.encoding) {
             self.set_error(format!("Failed to save file: {e}"));
             return;
         }
@@ -426,8 +540,7 @@ impl ScratchpadApp {
             return;
         };
 
-        let contents = self.apply_line_ending(&self.text);
-        if let Err(e) = write_all_text(&path, &contents) {
+        if let Err(e) = self.write_text_with_encoding(&path, &self.text, self.encoding) {
             self.set_error(format!("Failed to save file: {e}"));
             return;
         }
@@ -484,18 +597,65 @@ impl ScratchpadApp {
         let Some(path) = &self.file_path else {
             return;
         };
-        match fs::read_to_string(path) {
-            Ok(contents) => {
-                let (normalized, line_ending) = Self::normalize_line_endings(&contents);
+        match Self::read_text_with_encoding(path) {
+            Ok((normalized, line_ending, encoding)) => {
                 self.text = normalized;
                 self.saved_snapshot = self.text.clone();
                 self.line_ending = line_ending;
+                self.encoding = encoding;
                 self.last_file_mtime = Self::read_file_mtime(&self.file_path);
                 self.request_editor_focus = true;
                 self.reset_editor_state = true;
             }
             Err(e) => self.set_error(format!("Failed to reload file: {e}")),
         }
+    }
+
+    fn apply_encoding_selection(&mut self, encoding: TextEncoding) {
+        if self.is_dirty() {
+            self.encoding = encoding;
+            self.set_error("Unsaved changes: encoding set for next save.");
+            return;
+        }
+        let Some(path) = &self.file_path else {
+            self.encoding = encoding;
+            return;
+        };
+        let mut bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.set_error(format!("Failed to reload file: {e}"));
+                return;
+            }
+        };
+        if matches!(encoding, TextEncoding::Utf8)
+            && bytes.starts_with(&[0xEF, 0xBB, 0xBF])
+        {
+            bytes.drain(0..3);
+        } else if matches!(encoding, TextEncoding::Utf16Le)
+            && bytes.starts_with(&[0xFF, 0xFE])
+        {
+            bytes.drain(0..2);
+        } else if matches!(encoding, TextEncoding::Utf16Be)
+            && bytes.starts_with(&[0xFE, 0xFF])
+        {
+            bytes.drain(0..2);
+        }
+        let text = match Self::decode_bytes(&bytes, encoding) {
+            Ok(text) => text,
+            Err(e) => {
+                self.set_error(format!("Failed to reload file: {e}"));
+                return;
+            }
+        };
+        let (normalized, line_ending) = Self::normalize_line_endings(&text);
+        self.text = normalized;
+        self.saved_snapshot = self.text.clone();
+        self.line_ending = line_ending;
+        self.encoding = encoding;
+        self.last_file_mtime = Self::read_file_mtime(&self.file_path);
+        self.request_editor_focus = true;
+        self.reset_editor_state = true;
     }
 
     fn start_update_check(&mut self, ctx: egui::Context) {
@@ -615,6 +775,7 @@ impl ScratchpadApp {
             LineEnding::Lf => "LF",
             LineEnding::CrLf => "CRLF",
         };
+        let encoding = self.encoding.label();
 
         let selection_text = if selection_len > 0 {
             format!("  |  Sel: {selection_len}")
@@ -629,7 +790,7 @@ impl ScratchpadApp {
         };
 
         format!(
-            "{name}{dirty}  |  Ln {line}, Col {col}  |  Lines: {lines}  Chars: {chars}  |  Size: {size_text}  |  {line_ending}{selection_text}"
+            "{name}{dirty}  |  Ln {line}, Col {col}  |  Lines: {lines}  Chars: {chars}  |  Size: {size_text}  |  {line_ending}  |  {encoding}{selection_text}"
         )
         + &update_text
     }
@@ -1785,6 +1946,31 @@ impl eframe::App for ScratchpadApp {
                                         if ui.button("About").clicked() {
                         ui.close_menu();
                         self.about_open = true;
+                    }
+                });
+
+                ui.menu_button("Encoding", |ui| {
+                    let mut selected = self.encoding;
+                    if ui
+                        .radio_value(&mut selected, TextEncoding::Utf8, "UTF-8")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.apply_encoding_selection(selected);
+                    }
+                    if ui
+                        .radio_value(&mut selected, TextEncoding::Utf16Le, "UTF-16 LE")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.apply_encoding_selection(selected);
+                    }
+                    if ui
+                        .radio_value(&mut selected, TextEncoding::Utf16Be, "UTF-16 BE")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.apply_encoding_selection(selected);
                     }
                 });
 
