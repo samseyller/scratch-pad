@@ -2574,9 +2574,6 @@ fn short_transport_error(err: &ureq::Transport) -> String {
     message
 }
 
-fn write_all_text(path: &Path, contents: &str) -> std::io::Result<()> {
-    fs::write(path, contents)
-}
 
 fn make_app_icon() -> egui::IconData {
     let size = 64u32;
