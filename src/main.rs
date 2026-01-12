@@ -311,17 +311,7 @@ impl ScratchpadApp {
     fn do_open_file(&mut self) {
         self.clear_error();
 
-        let picked = rfd::FileDialog::new()
-            .add_filter("Text Files", &["txt", "log", "md", "rst", "adoc"])
-            .add_filter("Config & Data", &["json", "yaml", "yml", "toml", "ini", "cfg", "ron"])
-            .add_filter(
-                "Source Code",
-                &["rs", "c", "cpp", "cs", "java", "py", "js", "ts", "go"],
-            )
-            .add_filter("Web Files", &["html", "css", "js", "ts"])
-            .add_filter("Structured Data", &["csv", "xml"])
-            .add_filter("All Files", &["*"])
-            .pick_file();
+        let picked = self.pick_open_file();
 
         let Some(path) = picked else {
             // User canceled.
@@ -362,6 +352,33 @@ impl ScratchpadApp {
             }
             Err(e) => self.set_error(format!("Failed to open file: {e}")),
         }
+    }
+
+    fn open_in_new_window(&mut self, path: PathBuf) {
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(err) => {
+                self.set_error(format!("Failed to launch new window: {err}"));
+                return;
+            }
+        };
+        if let Err(err) = std::process::Command::new(exe).arg(path).spawn() {
+            self.set_error(format!("Failed to launch new window: {err}"));
+        }
+    }
+
+    fn pick_open_file(&self) -> Option<PathBuf> {
+        rfd::FileDialog::new()
+            .add_filter("Text Files", &["txt", "log", "md", "rst", "adoc"])
+            .add_filter("Config & Data", &["json", "yaml", "yml", "toml", "ini", "cfg", "ron"])
+            .add_filter(
+                "Source Code",
+                &["rs", "c", "cpp", "cs", "java", "py", "js", "ts", "go"],
+            )
+            .add_filter("Web Files", &["html", "css", "js", "ts"])
+            .add_filter("Structured Data", &["csv", "xml"])
+            .add_filter("All Files", &["*"])
+            .pick_file()
     }
 
     /// Save: if we already have a path, save there; otherwise do Save As.
@@ -1578,6 +1595,13 @@ impl eframe::App for ScratchpadApp {
                         self.handle_command(PendingAction::OpenFile);
                     }
 
+                    if ui.button("Open in New Window...").clicked() {
+                        ui.close_menu();
+                        if let Some(path) = self.pick_open_file() {
+                            self.open_in_new_window(path);
+                        }
+                    }
+
                     ui.menu_button("Recent", |ui| {
                         let mut to_open: Option<PathBuf> = None;
                         let mut remove_entry: Option<String> = None;
@@ -2175,7 +2199,11 @@ impl eframe::App for ScratchpadApp {
         });
 
         if let Some(path) = dropped_paths.into_iter().next() {
-            self.maybe_defer_or_run(PendingAction::OpenPath(path));
+            if self.file_path.is_some() || !self.text.is_empty() {
+                self.open_in_new_window(path);
+            } else {
+                self.maybe_defer_or_run(PendingAction::OpenPath(path));
+            }
         }
 
         // ─────────────────────────────────────────────────────────────────────
