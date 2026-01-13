@@ -182,6 +182,9 @@ enum EditorAction {
     Cut,
     Paste,
     SelectAll,
+    Uppercase,
+    Lowercase,
+    Propercase,
 }
 
 /// Application state: one text buffer + some file metadata.
@@ -1442,6 +1445,33 @@ impl ScratchpadApp {
         }
     }
 
+    fn transform_selection(
+        &mut self,
+        ctx: &egui::Context,
+        range: egui::text::CCursorRange,
+        transform: impl FnOnce(&str) -> String,
+    ) {
+        let editor_id = egui::Id::new("editor");
+        let [min, max] = range.sorted();
+        let start = min.index;
+        let end = max.index;
+        if end <= start {
+            return;
+        }
+
+        let start_byte = Self::char_index_to_byte(&self.text, start);
+        let end_byte = Self::char_index_to_byte(&self.text, end);
+        let replacement = transform(&self.text[start_byte..end_byte]);
+        self.text.replace_range(start_byte..end_byte, &replacement);
+
+        let new_len = replacement.chars().count();
+        let new_range = egui::text::CCursorRange::two(
+            egui::text::CCursor::new(start),
+            egui::text::CCursor::new(start + new_len),
+        );
+        self.set_editor_selection(ctx, editor_id, new_range);
+    }
+
     fn read_clipboard_text(&mut self) -> Option<String> {
         match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
             Ok(text) if !text.is_empty() => Some(text),
@@ -1500,6 +1530,19 @@ impl ScratchpadApp {
         None
     }
 
+    fn editor_case_menu(&mut self, ui: &mut egui::Ui) -> Option<EditorAction> {
+        if ui.button("UPPERCASE").clicked() {
+            return Some(EditorAction::Uppercase);
+        }
+        if ui.button("lowercase").clicked() {
+            return Some(EditorAction::Lowercase);
+        }
+        if ui.button("Propercase").clicked() {
+            return Some(EditorAction::Propercase);
+        }
+        None
+    }
+
     fn perform_editor_action(
         &mut self,
         ctx: &egui::Context,
@@ -1552,6 +1595,30 @@ impl ScratchpadApp {
                     );
                     self.set_editor_selection(ctx, editor_id, new_range);
                 }
+                EditorAction::Uppercase => self.transform_selection(ctx, range, |text| {
+                    text.chars().flat_map(|ch| ch.to_uppercase()).collect()
+                }),
+                EditorAction::Lowercase => self.transform_selection(ctx, range, |text| {
+                    text.chars().flat_map(|ch| ch.to_lowercase()).collect()
+                }),
+                EditorAction::Propercase => self.transform_selection(ctx, range, |text| {
+                    let mut out = String::with_capacity(text.len());
+                    let mut new_word = true;
+                    for ch in text.chars() {
+                        if ch.is_alphabetic() {
+                            if new_word {
+                                out.extend(ch.to_uppercase());
+                            } else {
+                                out.extend(ch.to_lowercase());
+                            }
+                            new_word = false;
+                        } else {
+                            out.push(ch);
+                            new_word = true;
+                        }
+                    }
+                    out
+                }),
             }
             return;
         }
@@ -1560,17 +1627,20 @@ impl ScratchpadApp {
             match action {
                 EditorAction::Copy | EditorAction::Cut => return,
                 EditorAction::Paste => self.paste_from_clipboard(ctx),
-                EditorAction::SelectAll => {
-                    let len = self.text.chars().count();
-                    let new_range = egui::text::CCursorRange::two(
-                        egui::text::CCursor::new(0),
-                        egui::text::CCursor::new(len),
-                    );
-                    self.set_editor_selection(ctx, editor_id, new_range);
-                }
+            EditorAction::SelectAll => {
+                let len = self.text.chars().count();
+                let new_range = egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(len),
+                );
+                self.set_editor_selection(ctx, editor_id, new_range);
             }
-            return;
+            EditorAction::Uppercase
+            | EditorAction::Lowercase
+            | EditorAction::Propercase => {}
         }
+        return;
+    }
 
         match action {
             EditorAction::Copy => self.send_editor_event(ctx, egui::Event::Copy),
@@ -1586,6 +1656,9 @@ impl ScratchpadApp {
                     modifiers: egui::Modifiers::COMMAND,
                 },
             ),
+            EditorAction::Uppercase
+            | EditorAction::Lowercase
+            | EditorAction::Propercase => {}
         }
     }
 
@@ -1614,6 +1687,11 @@ impl ScratchpadApp {
                             egui::Layout::top_down_justified(egui::Align::LEFT),
                             |ui| {
                                 if let Some(action) = self.editor_action_menu(ui) {
+                                    self.pending_editor_action = Some(action);
+                                    close_menu = true;
+                                }
+                                ui.separator();
+                                if let Some(action) = self.editor_case_menu(ui) {
                                     self.pending_editor_action = Some(action);
                                     close_menu = true;
                                 }
