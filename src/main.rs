@@ -180,6 +180,7 @@ enum PendingAction {
 enum EditorAction {
     Copy,
     Cut,
+    Delete,
     Paste,
     SelectAll,
     Uppercase,
@@ -1521,6 +1522,10 @@ impl ScratchpadApp {
             return Some(EditorAction::Cut);
         }
 
+        if ui.button("Delete (Del)").clicked() {
+            return Some(EditorAction::Delete);
+        }
+
         if ui.button("Paste (Ctrl+V)").clicked() {
             return Some(EditorAction::Paste);
         }
@@ -1540,6 +1545,11 @@ impl ScratchpadApp {
         allow_fallback: bool,
     ) {
         let editor_id = egui::Id::new("editor");
+        let selection = if matches!(action, EditorAction::Delete) && selection.is_none() {
+            egui::TextEdit::load_state(ctx, editor_id).and_then(|state| state.cursor.char_range())
+        } else {
+            selection
+        };
         if let Some(range) = selection {
             let [min, max] = range.sorted();
             let start = min.index;
@@ -1559,6 +1569,16 @@ impl ScratchpadApp {
                         let end_byte = Self::char_index_to_byte(&self.text, end);
                         let selected = self.text[start_byte..end_byte].to_string();
                         self.copy_to_clipboard(&selected);
+                        self.text.replace_range(start_byte..end_byte, "");
+                        let cursor = egui::text::CCursor::new(start);
+                        let new_range = egui::text::CCursorRange::one(cursor);
+                        self.set_editor_selection(ctx, editor_id, new_range);
+                    }
+                }
+                EditorAction::Delete => {
+                    if end > start {
+                        let start_byte = Self::char_index_to_byte(&self.text, start);
+                        let end_byte = Self::char_index_to_byte(&self.text, end);
                         self.text.replace_range(start_byte..end_byte, "");
                         let cursor = egui::text::CCursor::new(start);
                         let new_range = egui::text::CCursorRange::one(cursor);
@@ -1615,25 +1635,51 @@ impl ScratchpadApp {
         if !allow_fallback {
             match action {
                 EditorAction::Copy | EditorAction::Cut => return,
+                EditorAction::Delete => {
+                    if let Some(range) = selection {
+                        let [min, max] = range.sorted();
+                        if max.index > min.index {
+                            let start_byte = Self::char_index_to_byte(&self.text, min.index);
+                            let end_byte = Self::char_index_to_byte(&self.text, max.index);
+                            self.text.replace_range(start_byte..end_byte, "");
+                            let cursor = egui::text::CCursor::new(min.index);
+                            let new_range = egui::text::CCursorRange::one(cursor);
+                            self.set_editor_selection(ctx, editor_id, new_range);
+                        }
+                    }
+                }
                 EditorAction::Paste => self.paste_from_clipboard(ctx),
-            EditorAction::SelectAll => {
-                let len = self.text.chars().count();
-                let new_range = egui::text::CCursorRange::two(
-                    egui::text::CCursor::new(0),
-                    egui::text::CCursor::new(len),
-                );
-                self.set_editor_selection(ctx, editor_id, new_range);
+                EditorAction::SelectAll => {
+                    let len = self.text.chars().count();
+                    let new_range = egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(len),
+                    );
+                    self.set_editor_selection(ctx, editor_id, new_range);
+                }
+                EditorAction::Uppercase
+                | EditorAction::Lowercase
+                | EditorAction::Propercase => {}
             }
-            EditorAction::Uppercase
-            | EditorAction::Lowercase
-            | EditorAction::Propercase => {}
+            return;
         }
-        return;
-    }
 
         match action {
             EditorAction::Copy => self.send_editor_event(ctx, egui::Event::Copy),
             EditorAction::Cut => self.send_editor_event(ctx, egui::Event::Cut),
+            EditorAction::Delete => {
+                if let Some(range) = selection {
+                    let [min, max] = range.sorted();
+                    if max.index > min.index {
+                        let start_byte = Self::char_index_to_byte(&self.text, min.index);
+                        let end_byte = Self::char_index_to_byte(&self.text, max.index);
+                        self.text.replace_range(start_byte..end_byte, "");
+                        let cursor = egui::text::CCursor::new(min.index);
+                        let new_range = egui::text::CCursorRange::one(cursor);
+                        self.set_editor_selection(ctx, editor_id, new_range);
+                    }
+                }
+            }
             EditorAction::Paste => self.paste_from_clipboard(ctx),
             EditorAction::SelectAll => self.send_editor_event(
                 ctx,
@@ -1667,9 +1713,10 @@ impl ScratchpadApp {
         };
 
         let mut close_menu = false;
-        let items: [(&str, EditorAction); 7] = [
+        let items: [(&str, EditorAction); 8] = [
             ("Copy (Ctrl+C)", EditorAction::Copy),
             ("Cut (Ctrl+X)", EditorAction::Cut),
+            ("Delete (Del)", EditorAction::Delete),
             ("Paste (Ctrl+V)", EditorAction::Paste),
             ("Select All (Ctrl+A)", EditorAction::SelectAll),
             ("UPPERCASE", EditorAction::Uppercase),
@@ -1689,7 +1736,7 @@ impl ScratchpadApp {
                             egui::Layout::top_down_justified(egui::Align::LEFT),
                             |ui| {
                                 for (idx, (label, action)) in items.iter().enumerate() {
-                                    if idx == 4 {
+                                    if idx == 5 {
                                         ui.separator();
                                     }
                                     let selected = idx == self.editor_context_menu_index;
