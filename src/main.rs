@@ -223,6 +223,7 @@ struct ScratchpadApp {
     editor_context_menu_open: bool,
     editor_context_menu_pos: Option<egui::Pos2>,
     editor_context_menu_selection: Option<egui::text::CCursorRange>,
+    editor_context_menu_index: usize,
     pending_editor_action: Option<EditorAction>,
 
     /// Show last error in a small status bar.
@@ -259,6 +260,7 @@ impl Default for ScratchpadApp {
             editor_context_menu_open: false,
             editor_context_menu_pos: None,
             editor_context_menu_selection: None,
+            editor_context_menu_index: 0,
             pending_editor_action: None,
             last_error: None,
             settings: AppSettings::default(),
@@ -1530,19 +1532,6 @@ impl ScratchpadApp {
         None
     }
 
-    fn editor_case_menu(&mut self, ui: &mut egui::Ui) -> Option<EditorAction> {
-        if ui.button("UPPERCASE").clicked() {
-            return Some(EditorAction::Uppercase);
-        }
-        if ui.button("lowercase").clicked() {
-            return Some(EditorAction::Lowercase);
-        }
-        if ui.button("Propercase").clicked() {
-            return Some(EditorAction::Propercase);
-        }
-        None
-    }
-
     fn perform_editor_action(
         &mut self,
         ctx: &egui::Context,
@@ -1667,6 +1656,10 @@ impl ScratchpadApp {
             return;
         }
 
+        ctx.input_mut(|i| {
+            i.events.retain(|event| !matches!(event, egui::Event::Key { .. } | egui::Event::Text(_)));
+        });
+
         let Some(pos) = self.editor_context_menu_pos else {
             self.editor_context_menu_open = false;
             self.editor_context_menu_selection = None;
@@ -1674,6 +1667,15 @@ impl ScratchpadApp {
         };
 
         let mut close_menu = false;
+        let items: [(&str, EditorAction); 7] = [
+            ("Copy (Ctrl+C)", EditorAction::Copy),
+            ("Cut (Ctrl+X)", EditorAction::Cut),
+            ("Paste (Ctrl+V)", EditorAction::Paste),
+            ("Select All (Ctrl+A)", EditorAction::SelectAll),
+            ("UPPERCASE", EditorAction::Uppercase),
+            ("lowercase", EditorAction::Lowercase),
+            ("Propercase", EditorAction::Propercase),
+        ];
         let area_response = egui::Area::new(egui::Id::new("editor_context_menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
@@ -1686,14 +1688,20 @@ impl ScratchpadApp {
                         ui.with_layout(
                             egui::Layout::top_down_justified(egui::Align::LEFT),
                             |ui| {
-                                if let Some(action) = self.editor_action_menu(ui) {
-                                    self.pending_editor_action = Some(action);
-                                    close_menu = true;
-                                }
-                                ui.separator();
-                                if let Some(action) = self.editor_case_menu(ui) {
-                                    self.pending_editor_action = Some(action);
-                                    close_menu = true;
+                                for (idx, (label, action)) in items.iter().enumerate() {
+                                    if idx == 4 {
+                                        ui.separator();
+                                    }
+                                    let selected = idx == self.editor_context_menu_index;
+                                    let response =
+                                        ui.add(egui::SelectableLabel::new(selected, *label));
+                                    if response.hovered() {
+                                        self.editor_context_menu_index = idx;
+                                    }
+                                    if response.clicked() {
+                                        self.pending_editor_action = Some(*action);
+                                        close_menu = true;
+                                    }
                                 }
                             },
                         );
@@ -1732,6 +1740,13 @@ impl eframe::App for ScratchpadApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_font_settings(ctx);
         self.poll_update_check();
+        if self.editor_context_menu_open {
+            ctx.input_mut(|i| {
+                i.events.retain(|event| {
+                    !matches!(event, egui::Event::Key { .. } | egui::Event::Text(_))
+                });
+            });
+        }
         if let Some(action) = self.pending_editor_action.take() {
             self.perform_editor_action(ctx, action, self.editor_context_menu_selection, false);
             if !self.editor_context_menu_open {
@@ -1740,14 +1755,16 @@ impl eframe::App for ScratchpadApp {
         }
         let mut open_find = false;
         let mut open_replace = false;
-        ctx.input_mut(|i| {
-            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::F) {
-                open_find = true;
-            }
-            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::R) {
-                open_replace = true;
-            }
-        });
+        if !self.editor_context_menu_open {
+            ctx.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::F) {
+                    open_find = true;
+                }
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::R) {
+                    open_replace = true;
+                }
+            });
+        }
         if open_find {
             self.find_state.open = true;
             self.find_state.show_replace = false;
@@ -1767,29 +1784,31 @@ impl eframe::App for ScratchpadApp {
         let mut hotkey_save_as = false;
         let mut hotkey_cycle_highlighting = false;
         let mut font_step = 0.0;
-        ctx.input_mut(|i| {
-            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::N) {
-                hotkey_new = true;
-            }
-            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::O) {
-                hotkey_open = true;
-            }
-            if i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S) {
-                hotkey_save_as = true;
-            } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::S) {
-                hotkey_save = true;
-            }
-            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::H) {
-                hotkey_cycle_highlighting = true;
-            }
-            if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
-                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
-            {
-                font_step = 0.5;
-            } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus) {
-                font_step = -0.5;
-            }
-        });
+        if !self.editor_context_menu_open {
+            ctx.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::N) {
+                    hotkey_new = true;
+                }
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::O) {
+                    hotkey_open = true;
+                }
+                if i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S) {
+                    hotkey_save_as = true;
+                } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::S) {
+                    hotkey_save = true;
+                }
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::H) {
+                    hotkey_cycle_highlighting = true;
+                }
+                if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
+                    || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
+                {
+                    font_step = 0.5;
+                } else if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus) {
+                    font_step = -0.5;
+                }
+            });
+        }
         if hotkey_new {
             self.handle_command(PendingAction::NewFile);
         }
