@@ -70,6 +70,47 @@ enum LineEnding {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenFilter {
+    Text,
+    ConfigData,
+    SourceCode,
+    WebFiles,
+    StructuredData,
+    AllFiles,
+}
+
+impl OpenFilter {
+    fn all() -> [(OpenFilter, &'static str, &'static [&'static str]); 6] {
+        [
+            (OpenFilter::Text, "Text Files", &["txt", "log", "md", "rst", "adoc"]),
+            (
+                OpenFilter::ConfigData,
+                "Config & Data",
+                &["json", "yaml", "yml", "toml", "ini", "cfg", "ron"],
+            ),
+            (
+                OpenFilter::SourceCode,
+                "Source Code",
+                &["rs", "c", "cpp", "cs", "java", "py", "js", "ts", "go"],
+            ),
+            (OpenFilter::WebFiles, "Web Files", &["html", "css", "js", "ts"]),
+            (OpenFilter::StructuredData, "Structured Data", &["csv", "xml"]),
+            (OpenFilter::AllFiles, "All Files", &["*"]),
+        ]
+    }
+
+    fn from_extension(ext: &str) -> Option<Self> {
+        let ext = ext.to_ascii_lowercase();
+        for (filter, _name, exts) in Self::all() {
+            if exts.iter().any(|e| e.eq_ignore_ascii_case(&ext)) {
+                return Some(filter);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TextEncoding {
     Utf8,
     Utf16Le,
@@ -227,6 +268,9 @@ struct ScratchpadApp {
     editor_context_menu_index: usize,
     pending_editor_action: Option<EditorAction>,
 
+    /// Last selected filter in the Open dialog (per session).
+    last_open_filter: OpenFilter,
+
     /// Show last error in a small status bar.
     last_error: Option<String>,
 
@@ -263,6 +307,7 @@ impl Default for ScratchpadApp {
             editor_context_menu_selection: None,
             editor_context_menu_index: 0,
             pending_editor_action: None,
+            last_open_filter: OpenFilter::Text,
             last_error: None,
             settings: AppSettings::default(),
             find_state: FindState::default(),
@@ -439,6 +484,8 @@ impl ScratchpadApp {
             return;
         };
 
+        self.update_last_open_filter(&path);
+
         match Self::read_text_with_encoding(&path) {
             Ok((normalized, line_ending, encoding)) => {
                 self.text = normalized;
@@ -459,6 +506,8 @@ impl ScratchpadApp {
     fn do_open_path(&mut self, path: PathBuf) {
         self.clear_error();
 
+        self.update_last_open_filter(&path);
+
         match Self::read_text_with_encoding(&path) {
             Ok((normalized, line_ending, encoding)) => {
                 self.text = normalized;
@@ -476,6 +525,8 @@ impl ScratchpadApp {
     }
 
     fn open_in_new_window(&mut self, path: PathBuf) {
+        self.update_last_open_filter(&path);
+
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
             Err(err) => {
@@ -489,17 +540,31 @@ impl ScratchpadApp {
     }
 
     fn pick_open_file(&self) -> Option<PathBuf> {
-        rfd::FileDialog::new()
-            .add_filter("Text Files", &["txt", "log", "md", "rst", "adoc"])
-            .add_filter("Config & Data", &["json", "yaml", "yml", "toml", "ini", "cfg", "ron"])
-            .add_filter(
-                "Source Code",
-                &["rs", "c", "cpp", "cs", "java", "py", "js", "ts", "go"],
-            )
-            .add_filter("Web Files", &["html", "css", "js", "ts"])
-            .add_filter("Structured Data", &["csv", "xml"])
-            .add_filter("All Files", &["*"])
-            .pick_file()
+        let mut dialog = rfd::FileDialog::new();
+
+        for (filter, name, extensions) in OpenFilter::all() {
+            if filter == self.last_open_filter {
+                dialog = dialog.add_filter(name, extensions);
+            }
+        }
+        for (filter, name, extensions) in OpenFilter::all() {
+            if filter != self.last_open_filter {
+                dialog = dialog.add_filter(name, extensions);
+            }
+        }
+
+        dialog.pick_file()
+    }
+
+    fn update_last_open_filter(&mut self, path: &Path) {
+        let ext = path.extension().and_then(|ext| ext.to_str());
+        if let Some(ext) = ext {
+            if let Some(filter) = OpenFilter::from_extension(ext) {
+                self.last_open_filter = filter;
+                return;
+            }
+        }
+        self.last_open_filter = OpenFilter::AllFiles;
     }
 
     /// Save: if we already have a path, save there; otherwise do Save As.
