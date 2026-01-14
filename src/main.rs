@@ -143,6 +143,7 @@ struct AppSettings {
     recent_files: Vec<String>,
     word_wrap: bool,
     highlight_mode: HighlightMode,
+    always_on_top: bool,
     check_updates: bool,
     watch_file_changes: bool,
 }
@@ -156,6 +157,7 @@ impl Default for AppSettings {
             recent_files: Vec::new(),
             word_wrap: true,
             highlight_mode: HighlightMode::Syntax,
+            always_on_top: false,
             check_updates: true,
             watch_file_changes: true,
         }
@@ -281,6 +283,7 @@ struct ScratchpadApp {
     find_state: FindState,
     about_open: bool,
 
+    applied_always_on_top: bool,
     update_available: Option<String>,
     update_available_url: Option<String>,
     update_check_in_flight: bool,
@@ -312,6 +315,7 @@ impl Default for ScratchpadApp {
             settings: AppSettings::default(),
             find_state: FindState::default(),
             about_open: false,
+            applied_always_on_top: false,
             update_available: None,
             update_available_url: None,
             update_check_in_flight: false,
@@ -872,6 +876,16 @@ impl ScratchpadApp {
             font_id.size = 14.0;
         }
         ctx.set_style(style);
+    }
+
+    fn apply_window_level(&mut self, ctx: &egui::Context) {
+        let level = if self.settings.always_on_top {
+            egui::viewport::WindowLevel::AlwaysOnTop
+        } else {
+            egui::viewport::WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        self.applied_always_on_top = self.settings.always_on_top;
     }
 
     fn make_editor_layouter(
@@ -1851,6 +1865,9 @@ impl eframe::App for ScratchpadApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_font_settings(ctx);
+        if self.applied_always_on_top != self.settings.always_on_top {
+            self.apply_window_level(ctx);
+        }
         self.poll_update_check();
         if self.editor_context_menu_open {
             ctx.input_mut(|i| {
@@ -2102,6 +2119,13 @@ impl eframe::App for ScratchpadApp {
                     changed |= ui
                         .checkbox(&mut self.settings.word_wrap, "Word wrap")
                         .changed();
+
+                    if ui
+                        .checkbox(&mut self.settings.always_on_top, "Always on top")
+                        .changed()
+                    {
+                        self.apply_window_level(ctx);
+                    }
                     ui.separator();
                     ui.label("Highlighting");
                     changed |= ui
