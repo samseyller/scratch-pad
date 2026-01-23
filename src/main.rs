@@ -27,7 +27,10 @@ use serde_json::Value;
 /// - Some eframe/egui versions differ in API; this code avoids newer methods like
 ///   TextEdit::wrap(bool) and Frame::close().
 const APP_ID: &str = "Scratchpad";
-const BUILD_TIME: &str = env!("SCRATCHPAD_BUILD_TIME", "unknown");
+const BUILD_TIME: &str = match option_env!("SCRATCHPAD_BUILD_TIME") {
+    Some(value) => value,
+    None => "unknown",
+};
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
