@@ -1289,7 +1289,13 @@ impl ScratchpadApp {
         self.find_state.highlight_all = false;
     }
 
-    fn select_match(&mut self, ctx: &egui::Context, start_char: usize, end_char: usize) {
+    fn select_match(
+        &mut self,
+        ctx: &egui::Context,
+        start_char: usize,
+        end_char: usize,
+        focus_editor: bool,
+    ) {
         let editor_id = egui::Id::new("editor");
         if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) {
             let range = egui::text::CCursorRange::two(
@@ -1299,8 +1305,10 @@ impl ScratchpadApp {
             state.cursor.set_char_range(Some(range));
             state.store(ctx, editor_id);
         }
-        ctx.memory_mut(|mem| mem.request_focus(editor_id));
-        self.request_editor_focus = true;
+        if focus_editor {
+            ctx.memory_mut(|mem| mem.request_focus(editor_id));
+            self.request_editor_focus = true;
+        }
     }
 
     fn find_matches_with(&self, regex: &Regex) -> Vec<FindMatch> {
@@ -1359,7 +1367,8 @@ impl ScratchpadApp {
         }
         let idx = self.find_next_match_index(ctx, &matches);
         let m = matches[idx];
-        self.select_match(ctx, m.start_char, m.end_char);
+        let focus_editor = !self.find_state.open;
+        self.select_match(ctx, m.start_char, m.end_char, focus_editor);
         self.find_state.scroll_to_match = true;
         self.set_find_result(format!("Match {}/{}", idx + 1, matches.len()));
     }
@@ -1379,7 +1388,8 @@ impl ScratchpadApp {
         }
         let idx = self.find_prev_match_index(ctx, &matches);
         let m = matches[idx];
-        self.select_match(ctx, m.start_char, m.end_char);
+        let focus_editor = !self.find_state.open;
+        self.select_match(ctx, m.start_char, m.end_char, focus_editor);
         self.find_state.scroll_to_match = true;
         self.set_find_result(format!("Match {}/{}", idx + 1, matches.len()));
     }
@@ -1399,7 +1409,8 @@ impl ScratchpadApp {
         }
         self.find_state.highlight_all = true;
         let m = matches[0];
-        self.select_match(ctx, m.start_char, m.end_char);
+        let focus_editor = !self.find_state.open;
+        self.select_match(ctx, m.start_char, m.end_char, focus_editor);
         self.find_state.scroll_to_match = true;
         self.set_find_result(format!("Found {} matches", matches.len()));
     }
@@ -1437,7 +1448,8 @@ impl ScratchpadApp {
         };
         self.text.replace_range(m.start_byte..m.end_byte, &replacement);
         let new_end = m.start_char + replacement.chars().count();
-        self.select_match(ctx, m.start_char, new_end);
+        let focus_editor = !self.find_state.open;
+        self.select_match(ctx, m.start_char, new_end, focus_editor);
         self.find_state.scroll_to_match = true;
         self.set_find_result(format!("Replaced {}/{}", idx + 1, matches.len()));
     }
@@ -1868,6 +1880,28 @@ impl eframe::App for ScratchpadApp {
         if self.applied_always_on_top != self.settings.always_on_top {
             self.apply_window_level(ctx);
         }
+        let find_input_id = egui::Id::new("find_input");
+        let find_has_focus = self.find_state.open
+            && ctx.memory(|m| m.focused()) == Some(find_input_id);
+        let mut find_submit = false;
+        if find_has_focus {
+            ctx.input_mut(|i| {
+                if i.key_pressed(egui::Key::Enter) {
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                    find_submit = true;
+                }
+                i.events.retain(|event| {
+                    match event {
+                        egui::Event::Key {
+                            key: egui::Key::Enter,
+                            ..
+                        } => false,
+                        egui::Event::Text(text) => text != "\n" && text != "\r",
+                        _ => true,
+                    }
+                });
+            });
+        }
         self.poll_update_check();
         if self.editor_context_menu_open {
             ctx.input_mut(|i| {
@@ -1905,6 +1939,10 @@ impl eframe::App for ScratchpadApp {
             self.find_state.show_replace = true;
             self.populate_find_from_selection(ctx);
             self.find_state.request_focus = true;
+        }
+        if find_submit {
+            self.find_next(ctx);
+            ctx.memory_mut(|m| m.request_focus(find_input_id));
         }
         self.check_external_change();
         let mut hotkey_new = false;
@@ -2556,7 +2594,11 @@ impl eframe::App for ScratchpadApp {
                             .inner;
 
                         if self.find_state.scroll_to_match {
-                            if let Some(cursor_range) = output.cursor_range.clone() {
+                            let cursor_range = output
+                                .cursor_range
+                                .clone()
+                                .or_else(|| output.state.cursor.range(&output.galley));
+                            if let Some(cursor_range) = cursor_range {
                                 let row_height = output
                                     .galley
                                     .rows
@@ -2576,6 +2618,19 @@ impl eframe::App for ScratchpadApp {
 
                         if self.find_state.highlight_all {
                             self.paint_find_highlights(ui, &output);
+                        }
+                        if self.find_state.open {
+                            if let Some(cursor_range) = output.state.cursor.range(&output.galley) {
+                                let painter = ui.painter_at(output.text_clip_rect);
+                                egui::text_selection::visuals::paint_text_selection(
+                                    &painter,
+                                    ui.visuals(),
+                                    output.galley_pos,
+                                    &output.galley,
+                                    &cursor_range,
+                                    None,
+                                );
+                            }
                         }
 
                         if right_click {
