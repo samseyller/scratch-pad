@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
@@ -253,6 +253,9 @@ struct ScratchpadApp {
 
     /// Last known modified timestamp for the opened file.
     last_file_mtime: Option<SystemTime>,
+    last_file_mtime_check: Option<Instant>,
+    file_mtime_rx: Option<Receiver<(PathBuf, Option<SystemTime>)>>,
+    file_mtime_in_flight: bool,
 
     /// If set, show the "Unsaved changes" dialog and then run this action.
     pending_action: Option<PendingAction>,
@@ -302,6 +305,9 @@ impl Default for ScratchpadApp {
             line_ending: LineEnding::Lf,
             encoding: TextEncoding::Utf8,
             last_file_mtime: None,
+            last_file_mtime_check: None,
+            file_mtime_rx: None,
+            file_mtime_in_flight: false,
             pending_action: None,
             request_editor_focus: true,
             reset_editor_state: false,
@@ -653,19 +659,51 @@ impl ScratchpadApp {
         let Some(path) = &self.file_path else {
             return;
         };
-        let Ok(metadata) = fs::metadata(path) else {
-            return;
-        };
-        let Ok(modified) = metadata.modified() else {
-            return;
-        };
-        if let Some(last) = self.last_file_mtime {
-            if modified > last {
-                self.file_change_prompt_open = true;
+        if let Some(rx) = &self.file_mtime_rx {
+            match rx.try_recv() {
+                Ok((checked_path, modified)) => {
+                    self.file_mtime_in_flight = false;
+                    self.file_mtime_rx = None;
+                    if Some(&checked_path) == self.file_path.as_ref() {
+                        if let Some(modified) = modified {
+                            if let Some(last) = self.last_file_mtime {
+                                if modified > last {
+                                    self.file_change_prompt_open = true;
+                                }
+                            } else {
+                                self.last_file_mtime = Some(modified);
+                            }
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.file_mtime_in_flight = false;
+                    self.file_mtime_rx = None;
+                }
             }
-        } else {
-            self.last_file_mtime = Some(modified);
         }
+
+        if self.file_change_prompt_open || self.file_mtime_in_flight {
+            return;
+        }
+
+        let now = Instant::now();
+        if let Some(last_check) = self.last_file_mtime_check {
+            if now.duration_since(last_check) < Duration::from_secs(2) {
+                return;
+            }
+        }
+        self.last_file_mtime_check = Some(now);
+
+        let path = path.clone();
+        let (tx, rx) = mpsc::channel();
+        self.file_mtime_in_flight = true;
+        self.file_mtime_rx = Some(rx);
+        thread::spawn(move || {
+            let modified = fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let _ = tx.send((path, modified));
+        });
     }
 
     fn reload_from_disk(&mut self) {
