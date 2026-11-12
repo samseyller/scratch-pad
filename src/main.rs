@@ -588,7 +588,7 @@ impl ScratchpadApp {
         };
 
         let update_text = if let Some(version) = &self.update_available {
-            format!("  |  New Verison Available: v{version}")
+            format!("  |  New Version Available: v{version}")
         } else {
             String::new()
         };
@@ -833,11 +833,11 @@ impl ScratchpadApp {
         let mut italics = normal.clone();
         let mut underline = normal.clone();
         italics.italics = true;
-        underline.underline = egui::Stroke::new(1.0, underline.color);
+        underline.underline = egui::Stroke::new(1.0_f32, underline.color);
 
         let mut h1 = bold.clone();
         h1.color = egui::Color32::from_rgb(160, 220, 160);
-        h1.underline = egui::Stroke::new(1.0, h1.color);
+        h1.underline = egui::Stroke::new(1.0_f32, h1.color);
 
         let mut h2 = bold.clone();
         h2.color = egui::Color32::from_rgb(220, 200, 140);
@@ -872,15 +872,12 @@ impl ScratchpadApp {
                 .take_while(|c| *c == '#')
                 .count();
             if heading_level >= 1 && heading_level <= 3 {
-                let heading_text = trimmed_content
-                    .trim_start_matches('#')
-                    .trim_start();
                 let heading_format = match heading_level {
                     1 => &h1,
                     2 => &h2,
                     _ => &h3,
                 };
-                job.append(heading_text, 0.0, heading_format.clone());
+                job.append(content, 0.0, heading_format.clone());
                 if line_ends_with_newline {
                     job.append("\n", 0.0, normal.clone());
                 }
@@ -895,10 +892,7 @@ impl ScratchpadApp {
                     let end_rel = rest[1..].find('`').map(|p| p + 2);
                     if let Some(end_rel) = end_rel {
                         let end = idx + end_rel;
-                        let code_text = &content[idx + 1..end - 1];
-                        job.append("`", 0.0, code.clone());
-                        job.append(code_text, 0.0, code.clone());
-                        job.append("`", 0.0, code.clone());
+                        job.append(&content[idx..end], 0.0, code.clone());
                         idx = end;
                         continue;
                     }
@@ -908,8 +902,7 @@ impl ScratchpadApp {
                     let end_rel = rest[2..].find("**").map(|p| p + 4);
                     if let Some(end_rel) = end_rel {
                         let end = idx + end_rel;
-                        let bold_text = &content[idx + 2..end - 2];
-                        job.append(bold_text, 0.0, bold.clone());
+                        job.append(&content[idx..end], 0.0, bold.clone());
                         idx = end;
                         continue;
                     }
@@ -919,8 +912,7 @@ impl ScratchpadApp {
                     let end_rel = rest[2..].find("__").map(|p| p + 4);
                     if let Some(end_rel) = end_rel {
                         let end = idx + end_rel;
-                        let underline_text = &content[idx + 2..end - 2];
-                        job.append(underline_text, 0.0, underline.clone());
+                        job.append(&content[idx..end], 0.0, underline.clone());
                         idx = end;
                         continue;
                     }
@@ -930,8 +922,7 @@ impl ScratchpadApp {
                     let end_rel = rest[1..].find('*').map(|p| p + 2);
                     if let Some(end_rel) = end_rel {
                         let end = idx + end_rel;
-                        let italic_text = &content[idx + 1..end - 1];
-                        job.append(italic_text, 0.0, italics.clone());
+                        job.append(&content[idx..end], 0.0, italics.clone());
                         idx = end;
                         continue;
                     }
@@ -941,8 +932,7 @@ impl ScratchpadApp {
                     let end_rel = rest[1..].find('_').map(|p| p + 2);
                     if let Some(end_rel) = end_rel {
                         let end = idx + end_rel;
-                        let italic_text = &content[idx + 1..end - 1];
-                        job.append(italic_text, 0.0, italics.clone());
+                        job.append(&content[idx..end], 0.0, italics.clone());
                         idx = end;
                         continue;
                     }
@@ -1147,13 +1137,13 @@ impl ScratchpadApp {
         }
         let idx = target_idx.unwrap_or_else(|| self.find_next_match_index(ctx, &matches));
         let m = matches[idx];
-        let replacement = if self.find_state.mode == FindMode::Regex {
-            regex
-                .replace(&self.text[m.start_byte..m.end_byte], self.find_state.replace.as_str())
-                .to_string()
-        } else {
-            self.find_state.replace.clone()
-        };
+        let replacement = expand_replacement(
+            &regex,
+            &self.text,
+            m.start_byte,
+            &self.find_state.replace,
+            self.find_state.mode == FindMode::Literal,
+        );
         self.text.replace_range(m.start_byte..m.end_byte, &replacement);
         let new_end = m.start_char + replacement.chars().count();
         self.select_match(ctx, m.start_char, new_end);
@@ -1174,10 +1164,12 @@ impl ScratchpadApp {
             self.set_find_result("No matches");
             return;
         }
-        let replaced = regex
-            .replace_all(&self.text, self.find_state.replace.as_str())
-            .to_string();
-        self.text = replaced;
+        self.text = replace_all_text(
+            &regex,
+            &self.text,
+            &self.find_state.replace,
+            self.find_state.mode == FindMode::Literal,
+        );
         self.request_editor_focus = true;
         self.set_find_result(format!("Replaced {}", matches.len()));
     }
@@ -1607,12 +1599,16 @@ impl eframe::App for ScratchpadApp {
         if self.file_change_prompt_open {
             let mut prompt_open = self.file_change_prompt_open;
             let mut action = None;
+            let dirty = self.is_dirty();
             egui::Window::new("File changed on disk")
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut prompt_open)
                 .show(ctx, |ui| {
                     ui.label("The file has changed outside of Scratchpad.");
+                    if dirty {
+                        ui.label("Reloading will discard your unsaved changes.");
+                    }
                     ui.add_space(8.0);
 
                     ui.horizontal(|ui| {
@@ -1628,6 +1624,11 @@ impl eframe::App for ScratchpadApp {
                     });
                 });
             self.file_change_prompt_open = prompt_open;
+            // Closing the window with its X button counts as "Ignore"; otherwise the
+            // stale mtime would immediately re-open the prompt.
+            if !prompt_open && action.is_none() {
+                action = Some("ignore");
+            }
             match action {
                 Some("reload") => {
                     self.reload_from_disk();
@@ -1983,12 +1984,13 @@ impl eframe::App for ScratchpadApp {
                         if ui.button("Don't Save").clicked() {
                             self.pending_action = None;
 
-                            // Discard by reverting the buffer to the last saved snapshot.
-                            self.text = self.saved_snapshot.clone();
-
                             if is_exit {
+                                // Revert so the close-request guard doesn't re-block the exit.
+                                self.text = self.saved_snapshot.clone();
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             } else {
+                                // New/Open replace the buffer themselves on success; if the
+                                // user cancels the file dialog, their edits are preserved.
                                 self.run_action(action.clone());
                                 self.pending_action = None;
                             }
@@ -2123,6 +2125,37 @@ fn short_transport_error(err: &ureq::Transport) -> String {
     message
 }
 
+/// Compute the replacement for the match starting at `start_byte`.
+/// Literal mode inserts the replacement verbatim (no `$1` expansion); regex mode
+/// expands capture groups, matching against the full text so anchors and `\b` work.
+fn expand_replacement(
+    regex: &Regex,
+    text: &str,
+    start_byte: usize,
+    replacement: &str,
+    literal: bool,
+) -> String {
+    if literal {
+        return replacement.to_string();
+    }
+    match regex.captures_at(text, start_byte) {
+        Some(caps) => {
+            let mut out = String::new();
+            caps.expand(replacement, &mut out);
+            out
+        }
+        None => replacement.to_string(),
+    }
+}
+
+fn replace_all_text(regex: &Regex, text: &str, replacement: &str, literal: bool) -> String {
+    if literal {
+        regex.replace_all(text, regex::NoExpand(replacement)).into_owned()
+    } else {
+        regex.replace_all(text, replacement).into_owned()
+    }
+}
+
 fn write_all_text(path: &Path, contents: &str) -> std::io::Result<()> {
     fs::write(path, contents)
 }
@@ -2248,5 +2281,123 @@ fn format_size(bytes: usize) -> String {
         format!("{:.1} {}", size, units[unit])
     } else {
         format!("{:.2} {}", size, units[unit])
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rx(p: &str) -> Regex {
+        Regex::new(p).unwrap()
+    }
+
+    #[test]
+    fn normalize_detects_crlf() {
+        let (t, le) = ScratchpadApp::normalize_line_endings("a\r\nb\r\n");
+        assert_eq!(t, "a\nb\n");
+        assert_eq!(le, LineEnding::CrLf);
+        let (t, le) = ScratchpadApp::normalize_line_endings("a\nb");
+        assert_eq!(t, "a\nb");
+        assert_eq!(le, LineEnding::Lf);
+    }
+
+    #[test]
+    fn apply_line_ending_roundtrip() {
+        let mut app = ScratchpadApp::default();
+        app.line_ending = LineEnding::CrLf;
+        assert_eq!(app.apply_line_ending("a\nb\n"), "a\r\nb\r\n");
+        app.line_ending = LineEnding::Lf;
+        assert_eq!(app.apply_line_ending("a\nb\n"), "a\nb\n");
+    }
+
+    #[test]
+    fn format_size_units() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(1023), "1023 B");
+        assert_eq!(format_size(1024), "1.00 KiB");
+        assert_eq!(format_size(1024 * 1024), "1.00 MiB");
+        assert_eq!(format_size(150 * 1024), "150 KiB");
+    }
+
+    #[test]
+    fn literal_replace_all_does_not_expand_dollars() {
+        let r = rx(&regex::escape("price"));
+        assert_eq!(replace_all_text(&r, "price price", "$5 $1", true), "$5 $1 $5 $1");
+    }
+
+    #[test]
+    fn regex_replace_all_expands_groups() {
+        let r = rx(r"(\w+)@(\w+)");
+        assert_eq!(replace_all_text(&r, "me@host", "$2/$1", false), "host/me");
+    }
+
+    #[test]
+    fn regex_replace_current_respects_context() {
+        // Anchors only match with the full text as context.
+        let r = rx(r"(?m)^foo");
+        assert_eq!(expand_replacement(&r, "x\nfoo bar", 2, "baz", false), "baz");
+
+        let r = rx(r"\bcat");
+        let text = "concat cat";
+        let m = r.find(text).unwrap();
+        assert_eq!(m.start(), 7);
+        assert_eq!(expand_replacement(&r, text, m.start(), "dog", false), "dog");
+    }
+
+    #[test]
+    fn regex_replace_current_expands_captures() {
+        let r = rx(r"(a)(b)");
+        assert_eq!(expand_replacement(&r, "xab", 1, "$2$1", false), "ba");
+    }
+
+    #[test]
+    fn literal_replace_current_is_verbatim() {
+        let r = rx(&regex::escape("a"));
+        assert_eq!(expand_replacement(&r, "a", 0, "$1", true), "$1");
+    }
+
+    const SAMPLES: &[&str] = &[
+        "",
+        "plain text",
+        "# Heading\n## Two\n### Three\n#### Four\n",
+        "**bold** and *italic* and __under__ and _it_ and `code`\n",
+        "snake_case_name and 2*3*4 and unmatched ** and ` tick\n",
+        "```\nfn main() {}\n```\nafter\n",
+        "héllo **wörld** ünïcode `ç`\n",
+        "// comment\nlet s = \"str\\\"q\"; 12.5 fn\n#include <x>\n",
+    ];
+
+    #[test]
+    fn markdown_highlight_preserves_text() {
+        let font = egui::FontId::monospace(14.0);
+        let visuals = egui::Visuals::dark();
+        for s in SAMPLES {
+            let job = ScratchpadApp::build_markdown_highlight_job(s, &font, f32::INFINITY, &visuals);
+            assert_eq!(&job.text, s, "markdown job altered text");
+        }
+    }
+
+    #[test]
+    fn syntax_highlight_preserves_text() {
+        let font = egui::FontId::monospace(14.0);
+        let visuals = egui::Visuals::dark();
+        for s in SAMPLES {
+            let job = ScratchpadApp::build_syntax_highlight_job(s, &font, f32::INFINITY, &visuals);
+            assert_eq!(&job.text, s, "syntax job altered text");
+        }
+    }
+
+    #[test]
+    fn push_recent_dedupes_and_caps() {
+        let mut app = ScratchpadApp::default();
+        for i in 0..12 {
+            app.push_recent(Path::new(&format!("f{i}.txt")));
+        }
+        app.push_recent(Path::new("f5.txt"));
+        assert_eq!(app.settings.recent_files.len(), 10);
+        assert_eq!(app.settings.recent_files[0], "f5.txt");
+        assert_eq!(app.settings.recent_files.iter().filter(|p| *p == "f5.txt").count(), 1);
     }
 }
