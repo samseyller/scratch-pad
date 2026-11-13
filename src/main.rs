@@ -1,6 +1,8 @@
 #![windows_subsystem = "windows"]
 
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -104,6 +106,123 @@ impl Default for AppSettings {
     }
 }
 
+/// Above this size the highlighter is skipped (it is O(n) work per edit).
+const MAX_HIGHLIGHT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Accent colors for highlighting, chosen per theme.
+///
+/// The accents are based on the Okabe-Ito colour-blind-safe palette, adjusted so
+/// each one has at least WCAG AA contrast (4.5:1) against the editor background in
+/// its theme and stays distinguishable under protan/deutan/tritan simulation
+/// (both are enforced by unit tests). Meaning is also carried by style (bold,
+/// italic, underline), never by colour alone.
+#[derive(Clone, Copy, Debug)]
+struct HighlightPalette {
+    /// De-emphasised text (comments).
+    muted: egui::Color32,
+    a: egui::Color32,
+    b: egui::Color32,
+    c: egui::Color32,
+    d: egui::Color32,
+}
+
+const DARK_PALETTE: HighlightPalette = HighlightPalette {
+    muted: egui::Color32::from_rgb(150, 150, 150),
+    a: egui::Color32::from_rgb(85, 180, 255),
+    b: egui::Color32::from_rgb(230, 118, 0),
+    c: egui::Color32::from_rgb(189, 78, 176),
+    d: egui::Color32::from_rgb(240, 236, 67),
+};
+
+const LIGHT_PALETTE: HighlightPalette = HighlightPalette {
+    muted: egui::Color32::from_rgb(96, 96, 96),
+    a: egui::Color32::from_rgb(0, 78, 174),
+    b: egui::Color32::from_rgb(166, 40, 0),
+    c: egui::Color32::from_rgb(124, 38, 115),
+    d: egui::Color32::from_rgb(0, 135, 72),
+};
+
+impl HighlightPalette {
+    fn for_visuals(visuals: &egui::Visuals) -> Self {
+        if visuals.dark_mode { DARK_PALETTE } else { LIGHT_PALETTE }
+    }
+}
+
+/// Append `text[start..end]` (if non-empty) as a single plain-formatted section.
+/// Coalescing plain runs keeps the LayoutJob small (it used to get one section
+/// per punctuation/whitespace character).
+fn flush_plain(
+    job: &mut egui::text::LayoutJob,
+    text: &str,
+    start: usize,
+    end: usize,
+    format: &egui::TextFormat,
+) {
+    if start < end {
+        job.append(&text[start..end], 0.0, format.clone());
+    }
+}
+
+/// Number of logical lines (always at least 1).
+fn count_lines(text: &str) -> usize {
+    text.bytes().filter(|&b| b == b'\n').count() + 1
+}
+
+/// 1-based (line, column) for a cursor at `char_idx`, without allocating.
+fn cursor_line_col(text: &str, char_idx: usize) -> (usize, usize) {
+    let byte = text
+        .char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let prefix = &text[..byte];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
+    let line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    (line, prefix[line_start..].chars().count() + 1)
+}
+
+/// Find all regex matches with byte and char offsets in a single pass
+/// (char offsets are accumulated incrementally instead of rescanning the prefix).
+fn find_matches_in(text: &str, regex: &Regex) -> Vec<FindMatch> {
+    let mut out = Vec::new();
+    let mut last_byte = 0usize;
+    let mut last_char = 0usize;
+    for m in regex.find_iter(text) {
+        let start_char = last_char + text[last_byte..m.start()].chars().count();
+        let end_char = start_char + text[m.start()..m.end()].chars().count();
+        last_byte = m.end();
+        last_char = end_char;
+        out.push(FindMatch {
+            start_byte: m.start(),
+            end_byte: m.end(),
+            start_char,
+            end_char,
+        });
+    }
+    out
+}
+
+fn hash_str(text: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// Cached match list for "highlight all", so it isn't recomputed every frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FindCacheKey {
+    text_hash: u64,
+    text_len: usize,
+    query: String,
+    mode: FindMode,
+    case_sensitive: bool,
+}
+
+struct FindCache {
+    key: FindCacheKey,
+    matches: Vec<FindMatch>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FindMode {
     Literal,
@@ -205,6 +324,8 @@ struct ScratchpadApp {
 
     file_change_prompt_open: bool,
     file_change_disabled: bool,
+
+    find_cache: Option<FindCache>,
 }
 
 impl Default for ScratchpadApp {
@@ -228,6 +349,7 @@ impl Default for ScratchpadApp {
             update_rx: None,
             file_change_prompt_open: false,
             file_change_disabled: false,
+            find_cache: None,
         }
     }
 }
@@ -542,12 +664,8 @@ impl ScratchpadApp {
 
         let dirty = if self.is_dirty() { "*" } else { "" };
 
-        let lines = if self.text.is_empty() {
-            1
-        } else {
-            self.text.bytes().filter(|&b| b == b'\n').count() + 1
-        };
-
+        let newlines = self.text.bytes().filter(|&b| b == b'\n').count();
+        let lines = newlines + 1;
         let chars = self.text.chars().count();
 
         let mut line = 1usize;
@@ -555,25 +673,15 @@ impl ScratchpadApp {
         let mut selection_len = 0usize;
         if let Some(state) = egui::TextEdit::load_state(ctx, egui::Id::new("editor")) {
             if let Some(range) = state.cursor.char_range() {
-                let cursor_idx = range.primary.index;
-                for (idx, ch) in self.text.chars().enumerate() {
-                    if idx >= cursor_idx {
-                        break;
-                    }
-                    if ch == '\n' {
-                        line += 1;
-                        col = 1;
-                    } else {
-                        col += 1;
-                    }
-                }
-
+                (line, col) = cursor_line_col(&self.text, range.primary.index);
                 let [min, max] = range.sorted();
                 selection_len = max.index.saturating_sub(min.index);
             }
         }
 
-        let size_bytes = self.apply_line_ending(&self.text).as_bytes().len();
+        // Size on disk: LF text expands by one byte per newline when saved as CRLF.
+        let size_bytes = self.text.len()
+            + if self.line_ending == LineEnding::CrLf { newlines } else { 0 };
         let size_text = format_size(size_bytes);
 
         let line_ending = match self.line_ending {
@@ -600,6 +708,10 @@ impl ScratchpadApp {
     }
 
     fn apply_font_settings(&self, ctx: &egui::Context) {
+        // Called every frame, so bail out cheaply when nothing needs changing.
+        if ctx.style().text_styles.values().all(|f| f.size == 14.0) {
+            return;
+        }
         let mut style = (*ctx.style()).clone();
         for (_text_style, font_id) in style.text_styles.iter_mut() {
             font_id.size = 14.0;
@@ -708,43 +820,34 @@ impl ScratchpadApp {
         let mut job = egui::text::LayoutJob::default();
         job.wrap.max_width = wrap_width;
 
-        let normal = egui::TextFormat {
+        let palette = HighlightPalette::for_visuals(visuals);
+        let fmt = |color: egui::Color32| egui::TextFormat {
             font_id: font_id.clone(),
-            color: visuals.text_color(),
+            color,
             ..Default::default()
         };
-        let comment = egui::TextFormat {
-            font_id: font_id.clone(),
-            color: egui::Color32::from_gray(140),
-            ..Default::default()
-        };
-        let string = egui::TextFormat {
-            font_id: font_id.clone(),
-            color: egui::Color32::from_rgb(160, 220, 160),
-            ..Default::default()
-        };
-        let keyword = egui::TextFormat {
-            font_id: font_id.clone(),
-            color: egui::Color32::from_rgb(120, 170, 255),
-            ..Default::default()
-        };
-        let number = egui::TextFormat {
-            font_id: font_id.clone(),
-            color: egui::Color32::from_rgb(220, 200, 140),
-            ..Default::default()
-        };
+        let normal = fmt(visuals.text_color());
+        let mut comment = fmt(palette.muted);
+        comment.italics = true;
+        let string = fmt(palette.b);
+        let keyword = fmt(palette.a);
+        let number = fmt(palette.c);
 
-        let mut idx = 0;
+        let mut plain_start = 0usize;
+        let mut idx = 0usize;
         while idx < text.len() {
             let rest = &text[idx..];
             if rest.starts_with("//") || rest.starts_with('#') {
+                flush_plain(&mut job, text, plain_start, idx, &normal);
                 let end = rest.find('\n').map(|p| idx + p).unwrap_or(text.len());
                 job.append(&text[idx..end], 0.0, comment.clone());
                 idx = end;
+                plain_start = end;
                 continue;
             }
 
             if rest.starts_with('"') {
+                flush_plain(&mut job, text, plain_start, idx, &normal);
                 let mut end = idx + 1;
                 let mut escape = false;
                 while end < text.len() {
@@ -767,6 +870,7 @@ impl ScratchpadApp {
                 }
                 job.append(&text[idx..end], 0.0, string.clone());
                 idx = end;
+                plain_start = end;
                 continue;
             }
 
@@ -780,17 +884,17 @@ impl ScratchpadApp {
                     }
                     end += next.len_utf8();
                 }
-                let token = &text[idx..end];
-                if Self::is_keyword(token) {
-                    job.append(token, 0.0, keyword.clone());
-                } else {
-                    job.append(token, 0.0, normal.clone());
+                if Self::is_keyword(&text[idx..end]) {
+                    flush_plain(&mut job, text, plain_start, idx, &normal);
+                    job.append(&text[idx..end], 0.0, keyword.clone());
+                    plain_start = end;
                 }
                 idx = end;
                 continue;
             }
 
             if ch.is_ascii_digit() {
+                flush_plain(&mut job, text, plain_start, idx, &normal);
                 let mut end = idx + ch.len_utf8();
                 while end < text.len() {
                     let next = text[end..].chars().next().unwrap();
@@ -801,13 +905,13 @@ impl ScratchpadApp {
                 }
                 job.append(&text[idx..end], 0.0, number.clone());
                 idx = end;
+                plain_start = end;
                 continue;
             }
 
-            let ch_len = ch.len_utf8();
-            job.append(&text[idx..idx + ch_len], 0.0, normal.clone());
-            idx += ch_len;
+            idx += ch.len_utf8();
         }
+        flush_plain(&mut job, text, plain_start, text.len(), &normal);
 
         job
     }
@@ -821,32 +925,37 @@ impl ScratchpadApp {
         let mut job = egui::text::LayoutJob::default();
         job.wrap.max_width = wrap_width;
 
+        let palette = HighlightPalette::for_visuals(visuals);
         let normal = egui::TextFormat {
             font_id: font_id.clone(),
             color: visuals.text_color(),
             ..Default::default()
         };
 
+        // Bold uses the theme's "strong" text colour (white-ish in dark mode,
+        // black-ish in light mode) plus wider letter spacing.
         let mut bold = normal.clone();
         bold.extra_letter_spacing = 1.0;
-        bold.color = egui::Color32::from_rgb(235, 235, 235);
+        bold.color = visuals.strong_text_color();
         let mut italics = normal.clone();
         let mut underline = normal.clone();
         italics.italics = true;
         underline.underline = egui::Stroke::new(1.0_f32, underline.color);
 
+        // Headings differ by colour AND style (underline / bold / italic).
         let mut h1 = bold.clone();
-        h1.color = egui::Color32::from_rgb(160, 220, 160);
+        h1.color = palette.a;
         h1.underline = egui::Stroke::new(1.0_f32, h1.color);
 
         let mut h2 = bold.clone();
-        h2.color = egui::Color32::from_rgb(220, 200, 140);
+        h2.color = palette.b;
 
         let mut h3 = italics.clone();
-        h3.color = egui::Color32::from_rgb(120, 170, 255);
+        h3.color = palette.c;
 
         let mut code = normal.clone();
-        code.color = egui::Color32::from_rgb(140, 170, 210);
+        code.color = palette.d;
+        code.background = visuals.code_bg_color;
 
         let mut in_code_fence = false;
         for line in text.split_inclusive('\n') {
@@ -871,7 +980,7 @@ impl ScratchpadApp {
                 .chars()
                 .take_while(|c| *c == '#')
                 .count();
-            if heading_level >= 1 && heading_level <= 3 {
+            if (1..=3).contains(&heading_level) {
                 let heading_format = match heading_level {
                     1 => &h1,
                     2 => &h2,
@@ -884,69 +993,37 @@ impl ScratchpadApp {
                 continue;
             }
 
-            let mut idx = 0;
+            let mut plain_start = 0usize;
+            let mut idx = 0usize;
             while idx < content.len() {
                 let rest = &content[idx..];
 
-                if rest.starts_with('`') {
-                    let end_rel = rest[1..].find('`').map(|p| p + 2);
-                    if let Some(end_rel) = end_rel {
-                        let end = idx + end_rel;
-                        job.append(&content[idx..end], 0.0, code.clone());
-                        idx = end;
-                        continue;
-                    }
+                let styled: Option<(usize, &egui::TextFormat)> = if rest.starts_with('`') {
+                    rest[1..].find('`').map(|p| (p + 2, &code))
+                } else if rest.starts_with("**") {
+                    rest[2..].find("**").map(|p| (p + 4, &bold))
+                } else if rest.starts_with("__") {
+                    rest[2..].find("__").map(|p| (p + 4, &underline))
+                } else if rest.starts_with('*') {
+                    rest[1..].find('*').map(|p| (p + 2, &italics))
+                } else if rest.starts_with('_') {
+                    rest[1..].find('_').map(|p| (p + 2, &italics))
+                } else {
+                    None
+                };
+
+                if let Some((len, format)) = styled {
+                    flush_plain(&mut job, line, plain_start, idx, &normal);
+                    job.append(&content[idx..idx + len], 0.0, format.clone());
+                    idx += len;
+                    plain_start = idx;
+                    continue;
                 }
 
-                if rest.starts_with("**") {
-                    let end_rel = rest[2..].find("**").map(|p| p + 4);
-                    if let Some(end_rel) = end_rel {
-                        let end = idx + end_rel;
-                        job.append(&content[idx..end], 0.0, bold.clone());
-                        idx = end;
-                        continue;
-                    }
-                }
-
-                if rest.starts_with("__") {
-                    let end_rel = rest[2..].find("__").map(|p| p + 4);
-                    if let Some(end_rel) = end_rel {
-                        let end = idx + end_rel;
-                        job.append(&content[idx..end], 0.0, underline.clone());
-                        idx = end;
-                        continue;
-                    }
-                }
-
-                if rest.starts_with('*') {
-                    let end_rel = rest[1..].find('*').map(|p| p + 2);
-                    if let Some(end_rel) = end_rel {
-                        let end = idx + end_rel;
-                        job.append(&content[idx..end], 0.0, italics.clone());
-                        idx = end;
-                        continue;
-                    }
-                }
-
-                if rest.starts_with('_') {
-                    let end_rel = rest[1..].find('_').map(|p| p + 2);
-                    if let Some(end_rel) = end_rel {
-                        let end = idx + end_rel;
-                        job.append(&content[idx..end], 0.0, italics.clone());
-                        idx = end;
-                        continue;
-                    }
-                }
-
-                let ch = rest.chars().next().unwrap();
-                let ch_len = ch.len_utf8();
-                job.append(&content[idx..idx + ch_len], 0.0, normal.clone());
-                idx += ch_len;
+                idx += rest.chars().next().unwrap().len_utf8();
             }
-
-            if line_ends_with_newline {
-                job.append("\n", 0.0, normal.clone());
-            }
+            // Plain tail, including the trailing newline (if any).
+            flush_plain(&mut job, line, plain_start, line.len(), &normal);
         }
 
         job
@@ -967,10 +1044,6 @@ impl ScratchpadApp {
         let mut builder = regex::RegexBuilder::new(&pattern);
         builder.case_insensitive(!self.find_state.case_sensitive);
         builder.build().map_err(|e| e.to_string())
-    }
-
-    fn byte_to_char_index(text: &str, byte_index: usize) -> usize {
-        text[..byte_index].chars().count()
     }
 
     fn current_selection_char_range(&self, ctx: &egui::Context) -> Option<(usize, usize)> {
@@ -1013,19 +1086,7 @@ impl ScratchpadApp {
     }
 
     fn find_matches_with(&self, regex: &Regex) -> Vec<FindMatch> {
-        regex
-            .find_iter(&self.text)
-            .map(|m| {
-                let start_char = Self::byte_to_char_index(&self.text, m.start());
-                let end_char = Self::byte_to_char_index(&self.text, m.end());
-                FindMatch {
-                    start_byte: m.start(),
-                    end_byte: m.end(),
-                    start_char,
-                    end_char,
-                }
-            })
-            .collect()
+        find_matches_in(&self.text, regex)
     }
 
     fn find_next_match_index(&self, ctx: &egui::Context, matches: &[FindMatch]) -> usize {
@@ -1186,12 +1247,49 @@ impl ScratchpadApp {
                 return;
             }
         };
-        let matches = self.find_matches_with(&regex);
+
+        // Recompute matches only when the text or the search settings changed.
+        let key = FindCacheKey {
+            text_hash: hash_str(&self.text),
+            text_len: self.text.len(),
+            query: self.find_state.query.clone(),
+            mode: self.find_state.mode,
+            case_sensitive: self.find_state.case_sensitive,
+        };
+        if self.find_cache.as_ref().map(|c| &c.key) != Some(&key) {
+            self.find_cache = Some(FindCache {
+                matches: find_matches_in(&self.text, &regex),
+                key,
+            });
+        }
+        let Some(cache) = &self.find_cache else {
+            return;
+        };
+        let matches = &cache.matches;
         if matches.is_empty() {
             return;
         }
+
+        // Only paint matches that intersect the visible area.
+        let clip = ui.clip_rect();
+        let top = output
+            .galley
+            .cursor_from_pos(clip.min - output.galley_pos)
+            .ccursor
+            .index;
+        let bottom = output
+            .galley
+            .cursor_from_pos(clip.max - output.galley_pos)
+            .ccursor
+            .index;
+        let first = matches.partition_point(|m| m.end_char < top);
+        let last = matches.partition_point(|m| m.start_char <= bottom);
+        if first >= last {
+            return;
+        }
+
         let painter = ui.painter_at(output.text_clip_rect);
-        for m in matches {
+        for m in &matches[first..last] {
             let range = egui::text::CursorRange::two(
                 output
                     .galley
@@ -1769,14 +1867,11 @@ impl eframe::App for ScratchpadApp {
                 egui::FontId::new(self.settings.font_size, self.settings.font_family.to_egui());
             let line_number_color = ui.visuals().weak_text_color();
 
-            let lines: Vec<String> = if show_line_numbers {
-                if self.text.is_empty() {
-                    vec![String::new()]
-                } else {
-                    self.text.split('\n').map(str::to_owned).collect()
-                }
+            let total_lines = count_lines(&self.text);
+            let highlight_mode = if self.text.len() > MAX_HIGHLIGHT_BYTES {
+                HighlightMode::Off
             } else {
-                Vec::new()
+                self.settings.highlight_mode
             };
 
             let scroll_area = if self.settings.word_wrap {
@@ -1789,7 +1884,6 @@ impl eframe::App for ScratchpadApp {
                 .show(ui, |ui| {
                     let available_width = ui.available_width();
                     let gutter_width = if show_line_numbers {
-                        let total_lines = lines.len().max(1);
                         let digits = total_lines.to_string().len();
                         let sample = "9".repeat(digits);
                         let width = ui
@@ -1810,7 +1904,6 @@ impl eframe::App for ScratchpadApp {
                     };
 
                     let text_margin_x = 4.0;
-                    let line_number_offset_y = -8.0;
                     let wrap_width = if self.settings.word_wrap {
                         (text_width - 2.0 * text_margin_x).max(1.0)
                     } else {
@@ -1818,60 +1911,19 @@ impl eframe::App for ScratchpadApp {
                     };
 
                     ui.horizontal(|ui| {
+                        // Reserve the gutter; the numbers themselves are painted below,
+                        // from the editor's own galley, so they always line up with the
+                        // text (including wrapped lines) and only visible rows are drawn.
+                        let gutter_x = ui.available_rect_before_wrap().min.x;
                         if show_line_numbers {
-                            let line_height = ui
-                                .fonts(|f| {
-                                    f.layout_no_wrap("0".to_owned(), font_id.clone(), line_number_color)
-                                })
-                                .size()
-                                .y;
-
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(gutter_width, 0.0),
-                                egui::Layout::top_down(egui::Align::Max),
-                                |ui| {
-                                    ui.spacing_mut().item_spacing.y = 0.0;
-                                    ui.add_space(line_number_offset_y);
-                                    for (idx, line) in lines.iter().enumerate() {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new((idx + 1).to_string())
-                                                    .color(line_number_color)
-                                                    .font(font_id.clone()),
-                                            )
-                                            .wrap(false),
-                                        );
-
-                                        let line_text = if line.is_empty() { " " } else { line };
-                                        let galley = ui.fonts(|f| {
-                                            let mut job = egui::text::LayoutJob::simple(
-                                                line_text.to_owned(),
-                                                font_id.clone(),
-                                                line_number_color,
-                                                wrap_width,
-                                            );
-                                            job.wrap.max_width = wrap_width;
-                                            f.layout_job(job)
-                                        });
-                                        let first_height = galley
-                                            .rows
-                                            .first()
-                                            .map(|row| row.height())
-                                            .unwrap_or(line_height);
-                                        let extra = (galley.size().y - first_height).max(0.0);
-                                        if extra > 0.0 {
-                                            ui.add_space(extra);
-                                        }
-                                    }
-                                },
-                            );
+                            ui.allocate_space(egui::vec2(gutter_width, 0.0));
                         }
 
                         let mut layouter = Self::make_editor_layouter(
                             self.settings.word_wrap,
                             wrap_width,
                             font_id.clone(),
-                            self.settings.highlight_mode,
+                            highlight_mode,
                         );
                         let text_edit = egui::TextEdit::multiline(&mut self.text)
                             .id(editor_id)
@@ -1905,6 +1957,33 @@ impl eframe::App for ScratchpadApp {
                                 ui.scroll_to_rect(cursor_rect, None);
                             }
                             self.find_state.scroll_to_match = false;
+                        }
+
+                        if show_line_numbers {
+                            let clip = ui.clip_rect();
+                            let painter = ui.painter();
+                            let right = gutter_x + gutter_width - 4.0;
+                            let mut line_no = 1usize;
+                            let mut line_start = true;
+                            for row in &output.galley.rows {
+                                let y = output.galley_pos.y + row.rect.min.y;
+                                if y > clip.max.y {
+                                    break;
+                                }
+                                if line_start && y + row.rect.height() >= clip.min.y {
+                                    painter.text(
+                                        egui::pos2(right, y),
+                                        egui::Align2::RIGHT_TOP,
+                                        line_no.to_string(),
+                                        font_id.clone(),
+                                        line_number_color,
+                                    );
+                                }
+                                line_start = row.ends_with_newline;
+                                if line_start {
+                                    line_no += 1;
+                                }
+                            }
                         }
 
                         if self.find_state.highlight_all {
@@ -2399,5 +2478,158 @@ mod tests {
         assert_eq!(app.settings.recent_files.len(), 10);
         assert_eq!(app.settings.recent_files[0], "f5.txt");
         assert_eq!(app.settings.recent_files.iter().filter(|p| *p == "f5.txt").count(), 1);
+    }
+
+    // ---- colour accessibility -------------------------------------------------
+
+    fn lin(c: u8) -> f32 {
+        let c = c as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    }
+
+    fn luminance(c: egui::Color32) -> f32 {
+        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+    }
+
+    fn contrast(a: egui::Color32, b: egui::Color32) -> f32 {
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// Machado et al. (2009) colour-vision-deficiency matrices, severity 1.0,
+    /// applied in linear RGB. `None` = normal vision.
+    const CVD: [(&str, Option<[[f32; 3]; 3]>); 4] = [
+        ("normal", None),
+        ("protan", Some([[0.152286, 1.052583, -0.204868], [0.114503, 0.786281, 0.099216], [-0.003882, -0.048116, 1.051998]])),
+        ("deutan", Some([[0.367322, 0.860646, -0.227968], [0.280085, 0.672501, 0.047413], [-0.011820, 0.042940, 0.968881]])),
+        ("tritan", Some([[1.255528, -0.076749, -0.178779], [-0.078411, 0.930809, 0.147602], [0.004733, 0.691367, 0.303900]])),
+    ];
+
+    fn lab(c: egui::Color32, cvd: &Option<[[f32; 3]; 3]>) -> [f32; 3] {
+        let mut rgb = [lin(c.r()), lin(c.g()), lin(c.b())];
+        if let Some(m) = cvd {
+            let o = rgb;
+            for i in 0..3 {
+                rgb[i] = (m[i][0] * o[0] + m[i][1] * o[1] + m[i][2] * o[2]).clamp(0.0, 1.0);
+            }
+        }
+        let x = 0.4124 * rgb[0] + 0.3576 * rgb[1] + 0.1805 * rgb[2];
+        let y = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+        let z = 0.0193 * rgb[0] + 0.1192 * rgb[1] + 0.9505 * rgb[2];
+        let f = |t: f32| if t > 0.008856 { t.cbrt() } else { 7.787 * t + 16.0 / 116.0 };
+        let (fx, fy, fz) = (f(x / 0.95047), f(y), f(z / 1.08883));
+        [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+    }
+
+    fn delta_e(a: egui::Color32, b: egui::Color32, cvd: &Option<[[f32; 3]; 3]>) -> f32 {
+        let (la, lb) = (lab(a, cvd), lab(b, cvd));
+        ((la[0] - lb[0]).powi(2) + (la[1] - lb[1]).powi(2) + (la[2] - lb[2]).powi(2)).sqrt()
+    }
+
+    fn themes() -> [(&'static str, egui::Visuals); 2] {
+        [("dark", egui::Visuals::dark()), ("light", egui::Visuals::light())]
+    }
+
+    #[test]
+    fn highlight_colors_meet_wcag_aa_contrast() {
+        for (name, v) in themes() {
+            let p = HighlightPalette::for_visuals(&v);
+            let bg = v.extreme_bg_color;
+            for (label, c) in [
+                ("text", v.text_color()),
+                ("strong", v.strong_text_color()),
+                ("muted", p.muted),
+                ("a", p.a),
+                ("b", p.b),
+                ("c", p.c),
+                ("d", p.d),
+            ] {
+                let ratio = contrast(c, bg);
+                assert!(ratio >= 4.5, "{name} {label}: contrast {ratio:.2}:1 < 4.5:1");
+            }
+        }
+    }
+
+    #[test]
+    fn highlight_colors_distinguishable_for_color_blindness() {
+        const MIN_DELTA_E: f32 = 20.0;
+        let mut failures = Vec::new();
+        for (name, v) in themes() {
+            let p = HighlightPalette::for_visuals(&v);
+            let colors = [("muted", p.muted), ("a", p.a), ("b", p.b), ("c", p.c), ("d", p.d)];
+            for (vision, cvd) in CVD.iter() {
+                for i in 0..colors.len() {
+                    for j in (i + 1)..colors.len() {
+                        let d = delta_e(colors[i].1, colors[j].1, cvd);
+                        if d < MIN_DELTA_E {
+                            failures.push(format!(
+                                "{name}/{vision}: {} vs {} too similar (dE {d:.1})",
+                                colors[i].0, colors[j].0
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        // The accents must also stand apart from ordinary body text. (Muted comment
+        // text is excluded: it is close to body text by design and is italic.)
+        for (name, v) in themes() {
+            let p = HighlightPalette::for_visuals(&v);
+            for (vision, cvd) in CVD.iter() {
+                for (label, c) in [("a", p.a), ("b", p.b), ("c", p.c), ("d", p.d)] {
+                    let d = delta_e(c, v.text_color(), cvd);
+                    if d < MIN_DELTA_E {
+                        failures.push(format!("{name}/{vision}: {label} vs body text too similar (dE {d:.1})"));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "
+{}", failures.join("
+"));
+    }
+
+    // ---- helpers --------------------------------------------------------------
+
+    #[test]
+    fn cursor_line_col_handles_unicode_and_edges() {
+        assert_eq!(cursor_line_col("", 0), (1, 1));
+        assert_eq!(cursor_line_col("abc", 2), (1, 3));
+        assert_eq!(cursor_line_col("ab\ncd", 3), (2, 1));
+        assert_eq!(cursor_line_col("ab\ncd", 5), (2, 3));
+        assert_eq!(cursor_line_col("héé\nxü", 6), (2, 3));
+        assert_eq!(cursor_line_col("ab", 99), (1, 3));
+    }
+
+    #[test]
+    fn count_lines_counts_newlines() {
+        assert_eq!(count_lines(""), 1);
+        assert_eq!(count_lines("a\nb\n"), 3);
+    }
+
+    #[test]
+    fn find_matches_char_offsets_match_naive() {
+        let text = "héllo wörld héllo\nünï héllo";
+        let r = Regex::new("héllo").unwrap();
+        let got = find_matches_in(text, &r);
+        assert_eq!(got.len(), 3);
+        for m in got {
+            assert_eq!(m.start_char, text[..m.start_byte].chars().count());
+            assert_eq!(m.end_char, text[..m.end_byte].chars().count());
+        }
+        // Empty matches shouldn't break the incremental offsets.
+        let got = find_matches_in("aé", &Regex::new("").unwrap());
+        assert_eq!(got.iter().map(|m| m.start_char).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn highlight_jobs_coalesce_plain_text() {
+        let font = egui::FontId::monospace(14.0);
+        let visuals = egui::Visuals::dark();
+        let text = "a + b - c * d / e; (f, g) [h] {i}\n".repeat(50);
+        let job = ScratchpadApp::build_syntax_highlight_job(&text, &font, f32::INFINITY, &visuals);
+        assert_eq!(job.text, text);
+        assert!(job.sections.len() < 10, "sections: {}", job.sections.len());
     }
 }
