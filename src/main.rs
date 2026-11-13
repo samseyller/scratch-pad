@@ -3039,10 +3039,34 @@ impl ScratchpadApp {
                         if output.response.hovered()
                             && ctx.input(|i| i.pointer.secondary_pressed())
                         {
-                            self.context_selection = selection_before;
-                            if let Some(range) = selection_before {
-                                // The press already moved the cursor this frame; put the
-                                // old selection back and redraw.
+                            // Right-clicking inside a selection keeps it; anywhere else
+                            // puts the cursor where the click landed (so Paste goes there).
+                            let click = ctx.input(|i| i.pointer.interact_pos());
+                            let clicked_at = click.map(|pos| {
+                                usize::from(
+                                    output.galley.cursor_from_pos(pos - output.galley_pos).index,
+                                )
+                            });
+                            let inside_selection = match (selection_before, clicked_at) {
+                                (Some(range), Some(at)) => {
+                                    let [min, max] = range.sorted_cursors();
+                                    let (start, end) =
+                                        (usize::from(min.index), usize::from(max.index));
+                                    end > start && at >= start && at <= end
+                                }
+                                _ => false,
+                            };
+                            let target = if inside_selection {
+                                selection_before
+                            } else {
+                                clicked_at.map(|at| {
+                                    egui::text::CCursorRange::one(egui::text::CCursor::new(at))
+                                })
+                            };
+                            self.context_selection = target;
+                            if let Some(range) = target {
+                                // The press already moved the cursor this frame (and may
+                                // have selected a word or line); set it explicitly and redraw.
                                 self.set_editor_selection_state(ctx, range);
                                 self.last_selection = Some(range);
                                 ctx.request_repaint();
