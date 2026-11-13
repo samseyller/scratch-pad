@@ -46,7 +46,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         APP_ID,
         native_options,
-        Box::new(move |cc| Box::new(ScratchpadApp::new(cc, initial_path.clone()))),
+        Box::new(move |cc| Ok(Box::new(ScratchpadApp::new(cc, initial_path.clone())))),
     )
 }
 
@@ -772,11 +772,11 @@ impl ScratchpadApp {
         let mut line = 1usize;
         let mut col = 1usize;
         let mut selection_len = 0usize;
-        if let Some(state) = egui::TextEdit::load_state(ctx, egui::Id::new("editor")) {
+        if let Some(state) = egui::TextEdit::load_state(ctx, egui::Id::unique("editor")) {
             if let Some(range) = state.cursor.char_range() {
-                (line, col) = self.cached_cursor_line_col(range.primary.index);
-                let [min, max] = range.sorted();
-                selection_len = max.index.saturating_sub(min.index);
+                (line, col) = self.cached_cursor_line_col(usize::from(range.primary.index));
+                let [min, max] = range.sorted_cursors();
+                selection_len = usize::from(max.index).saturating_sub(usize::from(min.index));
             }
         }
 
@@ -810,14 +810,14 @@ impl ScratchpadApp {
 
     fn apply_font_settings(&self, ctx: &egui::Context) {
         // Called every frame, so bail out cheaply when nothing needs changing.
-        if ctx.style().text_styles.values().all(|f| f.size == 14.0) {
+        if ctx.global_style().text_styles.values().all(|f| f.size == 14.0) {
             return;
         }
-        let mut style = (*ctx.style()).clone();
+        let mut style = (*ctx.global_style()).clone();
         for (_text_style, font_id) in style.text_styles.iter_mut() {
             font_id.size = 14.0;
         }
-        ctx.set_style(style);
+        ctx.set_global_style(style);
     }
 
     fn make_editor_layouter<'a>(
@@ -826,8 +826,9 @@ impl ScratchpadApp {
         wrap_width: f32,
         font_id: egui::FontId,
         highlight_mode: HighlightMode,
-    ) -> impl FnMut(&egui::Ui, &str, f32) -> Arc<egui::Galley> + 'a {
+    ) -> impl FnMut(&egui::Ui, &dyn egui::TextBuffer, f32) -> Arc<egui::Galley> + 'a {
         move |ui, text, _wrap_width| {
+            let text = text.as_str();
             let max_width = if wrap { wrap_width } else { f32::INFINITY };
             let dark = ui.visuals().dark_mode;
             let ppp_bits = ui.ctx().pixels_per_point().to_bits();
@@ -864,7 +865,7 @@ impl ScratchpadApp {
                     job
                 }
             };
-            let galley = ui.fonts(|f| f.layout_job(job));
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
             *cache.borrow_mut() = Some(LayoutCache {
                 text: text.to_owned(),
                 mode: highlight_mode,
@@ -1173,12 +1174,12 @@ impl ScratchpadApp {
     }
 
     fn current_selection_char_range(&self, ctx: &egui::Context) -> Option<(usize, usize)> {
-        let editor_id = egui::Id::new("editor");
+        let editor_id = egui::Id::unique("editor");
         egui::TextEdit::load_state(ctx, editor_id)
             .and_then(|state| state.cursor.char_range())
             .map(|range| {
-                let [min, max] = range.sorted();
-                (min.index, max.index)
+                let [min, max] = range.sorted_cursors();
+                (usize::from(min.index), usize::from(max.index))
             })
     }
 
@@ -1191,14 +1192,14 @@ impl ScratchpadApp {
         }
         let selected = egui::text_selection::text_cursor_state::slice_char_range(
             &self.text,
-            start..end,
+            start.into()..end.into(),
         );
         self.find_state.query = selected.to_string();
         self.find_state.highlight_all = false;
     }
 
     fn select_match(&mut self, ctx: &egui::Context, start_char: usize, end_char: usize) {
-        let editor_id = egui::Id::new("editor");
+        let editor_id = egui::Id::unique("editor");
         if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) {
             let range = egui::text::CCursorRange::two(
                 egui::text::CCursor::new(start_char),
@@ -1397,47 +1398,53 @@ impl ScratchpadApp {
             return;
         }
 
-        // Only paint matches that intersect the visible area.
+        // Paint only the visible rows. This works from the row list (binary search plus
+        // a running char count) because Galley::cursor_from_pos / pos_from_cursor walk the
+        // whole galley, which costs tens of milliseconds per frame on huge documents.
         let clip = ui.clip_rect();
-        let top = output
-            .galley
-            .cursor_from_pos(clip.min - output.galley_pos)
-            .ccursor
-            .index;
-        let bottom = output
-            .galley
-            .cursor_from_pos(clip.max - output.galley_pos)
-            .ccursor
-            .index;
-        let first = matches.partition_point(|m| m.end_char < top);
-        let last = matches.partition_point(|m| m.start_char <= bottom);
-        if first >= last {
+        let origin = output.galley_pos.to_vec2();
+        let rows = &output.galley.rows;
+        let first_row = rows.partition_point(|r| r.rect().max.y + origin.y < clip.min.y);
+        let end_row = rows.partition_point(|r| r.rect().min.y + origin.y <= clip.max.y);
+        if first_row >= end_row {
             return;
         }
+        let mut row_start: usize = rows[..first_row]
+            .iter()
+            .map(|r| usize::from(r.char_count_including_newline()))
+            .sum();
 
         let painter = ui.painter_at(output.text_clip_rect);
-        for m in &matches[first..last] {
-            let range = egui::text::CursorRange::two(
-                output
-                    .galley
-                    .from_ccursor(egui::text::CCursor::new(m.start_char)),
-                output
-                    .galley
-                    .from_ccursor(egui::text::CCursor::new(m.end_char)),
-            );
-            egui::text_selection::visuals::paint_text_selection(
-                &painter,
-                ui.visuals(),
-                output.galley_pos,
-                &output.galley,
-                &range,
-                None,
-            );
+        let color = ui.visuals().selection.bg_fill;
+        for row in &rows[first_row..end_row] {
+            let row_end = row_start + usize::from(row.char_count_excluding_newline());
+            let next_start = row_start + usize::from(row.char_count_including_newline());
+            let first_match = matches.partition_point(|m| m.end_char <= row_start);
+            for m in matches[first_match..]
+                .iter()
+                .take_while(|m| m.start_char < next_start)
+            {
+                // Clip the match to this row's text (a match can span several rows).
+                let s = m.start_char.max(row_start);
+                let e = m.end_char.min(row_end);
+                if e <= s {
+                    continue;
+                }
+                let x0 = row.x_offset((s - row_start).into());
+                let x1 = row.x_offset((e - row_start).into());
+                let r = row.rect();
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(r.min.x + x0, r.min.y),
+                    egui::pos2(r.min.x + x1, r.max.y),
+                );
+                painter.rect_filled(rect.translate(origin), 0.0, color);
+            }
+            row_start = next_start;
         }
     }
 
     fn send_editor_event(&mut self, ctx: &egui::Context, event: egui::Event) {
-        let editor_id = egui::Id::new("editor");
+        let editor_id = egui::Id::unique("editor");
         ctx.memory_mut(|mem| mem.request_focus(editor_id));
         ctx.input_mut(|i| i.events.push(event));
         self.request_editor_focus = true;
@@ -1460,15 +1467,17 @@ impl eframe::App for ScratchpadApp {
         let _ = save_config_settings(&self.settings);
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.frame(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame(ui);
     }
 }
 
 impl ScratchpadApp {
-    /// One UI frame. Separate from `update` so it can be driven without an
+    /// One UI frame. Separate from `App::ui` so it can be driven without an
     /// `eframe::Frame` (see `bench.rs`).
-    fn frame(&mut self, ctx: &egui::Context) {
+    fn frame(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = root_ui.ctx().clone();
+        let ctx = &ctx;
         self.apply_font_settings(ctx);
         self.poll_update_check();
         let mut open_find = false;
@@ -1554,16 +1563,16 @@ impl ScratchpadApp {
         // ─────────────────────────────────────────────────────────────────────
         // Top menu bar
         // ─────────────────────────────────────────────────────────────────────
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
+        egui::Panel::top("menu_bar").show(root_ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New (Ctrl+N)").clicked() {
-                        ui.close_menu();
+                        ui.close();
                         self.handle_command(PendingAction::NewFile);
                     }
 
                     if ui.button("Open... (Ctrl+O)").clicked() {
-                        ui.close_menu();
+                        ui.close();
                         self.handle_command(PendingAction::OpenFile);
                     }
 
@@ -1577,7 +1586,7 @@ impl ScratchpadApp {
                         } else {
                             for entry in recent.into_iter().take(10) {
                                 if ui.button(entry.as_str()).clicked() {
-                                    ui.close_menu();
+                                    ui.close();
                                     let path = PathBuf::from(&entry);
                                     if path.exists() {
                                         to_open = Some(path);
@@ -1610,41 +1619,41 @@ impl ScratchpadApp {
                         .add_enabled(save_enabled, egui::Button::new("Save (Ctrl+S)"))
                         .clicked()
                     {
-                        ui.close_menu();
+                        ui.close();
                         self.do_save();
                     }
 
                     if ui.button("Save As…").clicked() {
-                        ui.close_menu();
+                        ui.close();
                         self.do_save_as();
                     }
 
                     ui.separator();
 
                     if ui.button("Exit").clicked() {
-                        ui.close_menu();
+                        ui.close();
                         self.maybe_defer_or_run(PendingAction::Exit);
                     }
                 });
 
                 ui.menu_button("Edit", |ui| {
                     if ui.button("Copy (Ctrl+C)").clicked() {
-                        ui.close_menu();
+                        ui.close();
                         self.send_editor_event(ctx, egui::Event::Copy);
                     }
 
                     if ui.button("Cut (Ctrl+X)").clicked() {
-                        ui.close_menu();
+                        ui.close();
                         self.send_editor_event(ctx, egui::Event::Cut);
                     }
 
                     if ui.button("Paste (Ctrl+V)").clicked() {
-                        ui.close_menu();
+                        ui.close();
                         self.paste_from_clipboard(ctx);
                     }
 
                     if ui.button("Select All (Ctrl+A)").clicked() {
-                        ui.close_menu();
+                        ui.close();
                         self.send_editor_event(
                             ctx,
                             egui::Event::Key {
@@ -1659,13 +1668,13 @@ impl ScratchpadApp {
 
                     ui.separator();
                     if ui.button("Find (Ctrl+F)").clicked() {
-                        ui.close_menu();
+                        ui.close();
                         self.find_state.open = true;
                         self.find_state.show_replace = false;
                         self.find_state.request_focus = true;
                     }
                     if ui.button("Find and Replace (Ctrl+R)").clicked() {
-                        ui.close_menu();
+                        ui.close();
                         self.find_state.open = true;
                         self.find_state.show_replace = true;
                         self.find_state.request_focus = true;
@@ -1748,7 +1757,7 @@ impl ScratchpadApp {
                 ui.menu_button("Help", |ui| {
                     if let Some(version) = &self.update_available {
                         if ui.button(format!("Update to v{version}")).clicked() {
-                            ui.close_menu();
+                            ui.close();
                             if let Some(url) = &self.update_available_url {
                                 ctx.open_url(egui::OpenUrl::new_tab(url));
                             } else {
@@ -1767,12 +1776,12 @@ impl ScratchpadApp {
                     }
 
                     if ui.button("Releases").clicked() {
-                        ui.close_menu();
+                        ui.close();
                         ctx.open_url(egui::OpenUrl::new_tab("https://github.com/samseyller/scratch-pad/releases"));
                     }
 
                                         if ui.button("About").clicked() {
-                        ui.close_menu();
+                        ui.close();
                         self.about_open = true;
                     }
                 });
@@ -1780,7 +1789,7 @@ impl ScratchpadApp {
                 // Right-side: show current full path (or Untitled)
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(path) = &self.file_path {
-                        ui.add(egui::Label::new(path.display().to_string()).truncate(true));
+                        ui.add(egui::Label::new(path.display().to_string()).truncate());
                     } else {
                         ui.add(egui::Label::new("Untitled"));
                     }
@@ -1898,7 +1907,7 @@ impl ScratchpadApp {
                         let find_response = ui.add(
                             egui::TextEdit::singleline(&mut self.find_state.query)
                                 .desired_width(240.0)
-                                .id(egui::Id::new("find_input")),
+                                .id(egui::Id::unique("find_input")),
                         );
                         if self.find_state.request_focus {
                             find_response.request_focus();
@@ -1975,7 +1984,7 @@ impl ScratchpadApp {
         // ─────────────────────────────────────────────────────────────────────
         // Bottom status bar
         // ─────────────────────────────────────────────────────────────────────
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+        egui::Panel::bottom("status_bar").show(root_ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(self.status_text(ctx));
 
@@ -1989,9 +1998,9 @@ impl ScratchpadApp {
         // ─────────────────────────────────────────────────────────────────────
         // Central editor
         // ─────────────────────────────────────────────────────────────────────
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default_margins().show(root_ui, |ui| {
             // Stable ID helps keep focus/state consistent.
-            let editor_id = egui::Id::new("editor");
+            let editor_id = egui::Id::unique("editor");
             if self.reset_editor_state {
                 egui::TextEdit::store_state(ctx, editor_id, Default::default());
                 self.reset_editor_state = false;
@@ -2022,7 +2031,7 @@ impl ScratchpadApp {
                         let digits = total_lines.to_string().len();
                         let sample = "9".repeat(digits);
                         let width = ui
-                            .fonts(|f| {
+                            .fonts_mut(|f| {
                                 f.layout_no_wrap(sample, font_id.clone(), line_number_color)
                             })
                             .size()
@@ -2092,11 +2101,11 @@ impl ScratchpadApp {
                                     .map(|row| row.height())
                                     .unwrap_or(self.settings.font_size);
                                 let cursor_rect = egui::text_selection::text_cursor_state::cursor_rect(
-                                    output.galley_pos,
                                     &output.galley,
                                     &cursor_range.primary,
                                     row_height,
-                                );
+                                )
+                                .translate(output.galley_pos.to_vec2());
                                 ui.scroll_to_rect(cursor_rect, None);
                             }
                             self.find_state.scroll_to_match = false;
@@ -2109,11 +2118,11 @@ impl ScratchpadApp {
                             let mut line_no = 1usize;
                             let mut line_start = true;
                             for row in &output.galley.rows {
-                                let y = output.galley_pos.y + row.rect.min.y;
+                                let y = output.galley_pos.y + row.rect().min.y;
                                 if y > clip.max.y {
                                     break;
                                 }
-                                if line_start && y + row.rect.height() >= clip.min.y {
+                                if line_start && y + row.rect().height() >= clip.min.y {
                                     painter.text(
                                         egui::pos2(right, y),
                                         egui::Align2::RIGHT_TOP,
@@ -2156,7 +2165,7 @@ impl ScratchpadApp {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .map(|f| f.path().to_path_buf())
                 .collect()
         });
 

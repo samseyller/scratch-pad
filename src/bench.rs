@@ -47,7 +47,7 @@ impl Harness {
             ..Default::default()
         };
         let app = &mut self.app;
-        let out = self.ctx.run(raw, |ctx| app.frame(ctx));
+        let out = self.ctx.run_ui(raw, |ui| app.frame(ui));
         let _ = self.ctx.tessellate(out.shapes, self.ctx.pixels_per_point());
         t.elapsed().as_secs_f64() * 1000.0
     }
