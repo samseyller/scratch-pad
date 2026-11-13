@@ -132,6 +132,8 @@ impl Default for AppSettings {
 const LARGE_DOC_UNDO_BYTES: usize = 1024 * 1024;
 /// Above this size the status bar warns that editing will be slow and memory-hungry.
 const HUGE_DOC_BYTES: usize = 5 * 1024 * 1024;
+/// Longest line the large-file view draws; the rest is cut off with an ellipsis.
+const VIEW_MAX_COLS: usize = 2000;
 const LARGE_DOC_MAX_UNDOS: usize = 10;
 const DEFAULT_MAX_UNDOS: usize = 100;
 
@@ -207,6 +209,29 @@ fn cursor_line_col(text: &str, char_idx: usize) -> (usize, usize) {
 
 /// Find all regex matches with byte and char offsets in a single pass
 /// (char offsets are accumulated incrementally instead of rescanning the prefix).
+/// Byte offset of the start of every line, plus the longest line (in bytes, capped at
+/// `VIEW_MAX_COLS`). Used by the large-file view to draw only the visible lines.
+struct LineIndex {
+    rev: u64,
+    starts: Vec<usize>,
+    max_cols: usize,
+}
+
+fn build_line_starts(text: &str) -> (Vec<usize>, usize) {
+    let mut starts = vec![0usize];
+    let mut max_len = 0usize;
+    let mut prev = 0usize;
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            max_len = max_len.max(i - prev);
+            prev = i + 1;
+            starts.push(prev);
+        }
+    }
+    max_len = max_len.max(text.len() - prev);
+    (starts, max_len.min(VIEW_MAX_COLS))
+}
+
 fn find_matches_in(text: &str, regex: &Regex) -> Vec<FindMatch> {
     let mut out = Vec::new();
     let mut last_byte = 0usize;
@@ -375,6 +400,13 @@ struct ScratchpadApp {
     /// Clear editor selection/state on the next frame (after New/Open).
     reset_editor_state: bool,
 
+    /// Large files open in a read-only view that lays out only the visible lines.
+    view_only: bool,
+    /// Byte range of the match Find last selected, shown in the large-file view.
+    view_match: Option<(usize, usize)>,
+    line_index: Option<LineIndex>,
+    confirm_edit_open: bool,
+
     /// Whether the editor's undo history is currently limited for a large document.
     undo_capped: bool,
 
@@ -420,6 +452,10 @@ impl Default for ScratchpadApp {
             pending_action: None,
             request_editor_focus: true,
             reset_editor_state: false,
+            view_only: false,
+            view_match: None,
+            line_index: None,
+            confirm_edit_open: false,
             undo_capped: false,
             last_error: None,
             settings: AppSettings::default(),
@@ -851,6 +887,180 @@ impl ScratchpadApp {
         + &update_text
     }
 
+    /// Read-only view for very large files: lays out only the visible lines, so opening
+    /// and scrolling stay fast and memory stays small. Supports Find (next/previous/all).
+    fn show_large_file_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Large file ({}): read-only view to keep things fast.",
+                    format_size(self.text.len())
+                ))
+                .strong(),
+            );
+            if ui.button("Edit anyway…").clicked() {
+                self.confirm_edit_open = true;
+            }
+        });
+        ui.separator();
+
+        if self.confirm_edit_open {
+            let mut open = true;
+            egui::Window::new("Edit large file?")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "Editing a {} file loads all of it into the editor. Opening it can \
+                         take several seconds, every keystroke may lag, and memory use can \
+                         reach several gigabytes.",
+                        format_size(self.text.len())
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("Edit anyway").clicked() {
+                            self.view_only = false;
+                            self.confirm_edit_open = false;
+                            self.request_editor_focus = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_edit_open = false;
+                        }
+                    });
+                });
+            if !open {
+                self.confirm_edit_open = false;
+            }
+            if !self.view_only {
+                return;
+            }
+        }
+
+        // Rebuild the line index and Find matches only when the text changed.
+        if self.line_index.as_ref().map(|l| l.rev) != Some(self.text_rev) {
+            let (starts, max_cols) = build_line_starts(&self.text);
+            self.line_index = Some(LineIndex { rev: self.text_rev, starts, max_cols });
+        }
+        let show_all = self.find_state.highlight_all && self.ensure_find_cache();
+
+        let font_id = egui::FontId::monospace(self.settings.font_size);
+        let text_color = ui.visuals().text_color();
+        let number_color = ui.visuals().weak_text_color();
+        let dark = ui.visuals().dark_mode;
+        let all_color = if dark {
+            egui::Color32::from_rgba_unmultiplied(255, 200, 40, 70)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(255, 190, 0, 90)
+        };
+        let current_color = if dark {
+            egui::Color32::from_rgba_unmultiplied(255, 140, 0, 150)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(255, 120, 0, 140)
+        };
+        let (char_w, row_h) = {
+            let g = ui.fonts_mut(|f| f.layout_no_wrap("0".to_string(), font_id.clone(), text_color));
+            (g.size().x, g.size().y)
+        };
+
+        let text = self.text.as_str();
+        let Some(index) = self.line_index.as_ref() else {
+            return;
+        };
+        let starts = &index.starts;
+        let total_lines = starts.len();
+        let gutter = if self.settings.show_line_numbers {
+            (total_lines.to_string().len() as f32 + 1.0) * char_w + 8.0
+        } else {
+            4.0
+        };
+        let content_w = gutter + (index.max_cols + 1) as f32 * char_w + 16.0;
+        let matches: &[FindMatch] = if show_all {
+            self.find_cache.as_ref().map_or(&[], |c| &c.matches[..])
+        } else {
+            &[]
+        };
+        let current = self.view_match;
+        let show_line_numbers = self.settings.show_line_numbers;
+
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let mut area = egui::ScrollArea::both().auto_shrink([false, false]);
+        let mut scroll_done = false;
+        if self.find_state.scroll_to_match {
+            if let Some((b, _)) = current {
+                let line = starts.partition_point(|&s| s <= b).saturating_sub(1);
+                let y = line as f32 * row_h - ui.available_height() / 2.0;
+                area = area.vertical_scroll_offset(y.max(0.0));
+            }
+            scroll_done = true;
+        }
+
+        area.show_rows(ui, row_h, total_lines, |ui, range| {
+            ui.set_min_width(content_w);
+            for line in range {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(content_w, row_h), egui::Sense::hover());
+                if !ui.is_rect_visible(rect) {
+                    continue;
+                }
+                let start = starts[line];
+                let raw_end = starts.get(line + 1).copied().unwrap_or(text.len());
+                let full = text[start..raw_end].trim_end_matches(['\n', '\r']);
+                let (shown, cut) = match full.char_indices().nth(VIEW_MAX_COLS) {
+                    Some((i, _)) => (&full[..i], true),
+                    None => (full, false),
+                };
+                let line_end = start + shown.len();
+                let painter = ui.painter();
+                let x0 = rect.min.x + gutter;
+
+                let shade = |a: usize, b: usize, color: egui::Color32| {
+                    let (a, b) = (a.max(start), b.min(line_end));
+                    if b <= a {
+                        return;
+                    }
+                    let c0 = text[start..a].chars().count() as f32;
+                    let c1 = text[start..b].chars().count() as f32;
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x0 + c0 * char_w, rect.min.y),
+                            egui::pos2(x0 + c1 * char_w, rect.max.y),
+                        ),
+                        0.0,
+                        color,
+                    );
+                };
+                let first = matches.partition_point(|m| m.end_byte <= start);
+                for m in matches[first..].iter().take_while(|m| m.start_byte < line_end) {
+                    shade(m.start_byte, m.end_byte, all_color);
+                }
+                if let Some((a, b)) = current {
+                    shade(a, b, current_color);
+                }
+
+                if show_line_numbers {
+                    painter.text(
+                        egui::pos2(rect.min.x + gutter - 6.0, rect.min.y),
+                        egui::Align2::RIGHT_TOP,
+                        (line + 1).to_string(),
+                        font_id.clone(),
+                        number_color,
+                    );
+                }
+                let label = if cut { format!("{shown}…") } else { shown.to_string() };
+                painter.text(
+                    egui::pos2(x0, rect.min.y),
+                    egui::Align2::LEFT_TOP,
+                    label,
+                    font_id.clone(),
+                    text_color,
+                );
+            }
+        });
+        if scroll_done {
+            self.find_state.scroll_to_match = false;
+        }
+    }
+
     /// Limit the editor's undo history while the document is large (see
     /// `LARGE_DOC_UNDO_BYTES`). Switching the limit restarts the history.
     fn update_undo_limit(&mut self, ctx: &egui::Context, editor_id: egui::Id) {
@@ -1239,6 +1449,9 @@ impl ScratchpadApp {
     }
 
     fn current_selection_char_range(&self, ctx: &egui::Context) -> Option<(usize, usize)> {
+        if self.view_only {
+            return self.find_state.last_found;
+        }
         let editor_id = egui::Id::unique("editor");
         let current = egui::TextEdit::load_state(ctx, editor_id)
             .and_then(|state| state.cursor.char_range())
@@ -1272,6 +1485,20 @@ impl ScratchpadApp {
 
     fn select_match(&mut self, ctx: &egui::Context, start_char: usize, end_char: usize) {
         self.find_state.last_found = Some((start_char, end_char));
+        if self.view_only {
+            // No text editor to select in: remember the match so the view can show it.
+            let start = self
+                .text
+                .char_indices()
+                .nth(start_char)
+                .map_or(self.text.len(), |(i, _)| i);
+            let end = self.text[start..]
+                .char_indices()
+                .nth(end_char - start_char)
+                .map_or(self.text.len(), |(i, _)| start + i);
+            self.view_match = Some((start, end));
+            return;
+        }
         let editor_id = egui::Id::unique("editor");
         if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) {
             let range = egui::text::CCursorRange::two(
@@ -1375,6 +1602,10 @@ impl ScratchpadApp {
     }
 
     fn replace_current(&mut self, ctx: &egui::Context) {
+        if self.view_only {
+            self.set_find_result("Read-only large-file view: choose Edit anyway to replace");
+            return;
+        }
         let regex = match self.build_find_regex() {
             Ok(r) => r,
             Err(e) => {
@@ -1414,6 +1645,10 @@ impl ScratchpadApp {
     }
 
     fn replace_all(&mut self) {
+        if self.view_only {
+            self.set_find_result("Read-only large-file view: choose Edit anyway to replace");
+            return;
+        }
         let regex = match self.build_find_regex() {
             Ok(r) => r,
             Err(e) => {
@@ -1437,19 +1672,17 @@ impl ScratchpadApp {
         self.set_find_result(format!("Replaced {}", matches.len()));
     }
 
-    fn paint_find_highlights(&mut self, ui: &egui::Ui, output: &TextEditOutput) {
-        if !self.find_state.highlight_all {
-            return;
-        }
+    /// Make sure `find_cache` holds the matches for the current text and search
+    /// settings. Returns false (and turns Find All off) if the pattern is invalid.
+    fn ensure_find_cache(&mut self) -> bool {
         let regex = match self.build_find_regex() {
             Ok(r) => r,
             Err(e) => {
                 self.set_find_result(e);
                 self.find_state.highlight_all = false;
-                return;
+                return false;
             }
         };
-
         // Recompute matches only when the text or the search settings changed.
         let key = FindCacheKey {
             rev: self.text_rev,
@@ -1462,6 +1695,13 @@ impl ScratchpadApp {
                 matches: find_matches_in(&self.text, &regex),
                 key,
             });
+        }
+        true
+    }
+
+    fn paint_find_highlights(&mut self, ui: &egui::Ui, output: &TextEditOutput) {
+        if !self.find_state.highlight_all || !self.ensure_find_cache() {
+            return;
         }
         let Some(cache) = &self.find_cache else {
             return;
@@ -2126,6 +2366,14 @@ impl ScratchpadApp {
                 egui::TextEdit::store_state(ctx, editor_id, Default::default());
                 self.reset_editor_state = false;
                 self.undo_capped = false;
+                self.view_only = self.text.len() > HUGE_DOC_BYTES;
+                self.view_match = None;
+                self.find_state.last_found = None;
+            }
+            if self.view_only {
+                self.show_large_file_view(ui);
+                self.request_editor_focus = false;
+                return;
             }
             self.update_undo_limit(ctx, editor_id);
             let show_line_numbers = self.settings.show_line_numbers;

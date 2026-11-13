@@ -47,7 +47,9 @@ impl Harness {
             ..Default::default()
         };
         let app = &mut self.app;
-        let out = self.ctx.run_ui(raw, |ui| app.frame(ui));
+        let mut out = self.ctx.run_ui(raw, |ui| app.frame(ui));
+        // Debug builds panic if texture deltas are dropped unapplied (no renderer here).
+        out.textures_delta.clear();
         let _ = self.ctx.tessellate(out.shapes, self.ctx.pixels_per_point());
         t.elapsed().as_secs_f64() * 1000.0
     }
@@ -189,4 +191,51 @@ fn undo_history_is_capped_for_large_documents() {
     small.frame(vec![]);
     type_with_pauses(&mut small, 30);
     assert!(undo_count(&small) > LARGE_DOC_MAX_UNDOS, "small doc kept {}", undo_count(&small));
+}
+
+#[test]
+fn line_starts_and_longest_line() {
+    assert_eq!(build_line_starts(""), (vec![0], 0));
+    assert_eq!(build_line_starts("ab\ncde\n"), (vec![0, 3, 7], 3));
+    assert_eq!(build_line_starts("x"), (vec![0], 1));
+    let long = "y".repeat(VIEW_MAX_COLS * 2);
+    assert_eq!(build_line_starts(&long).1, VIEW_MAX_COLS);
+}
+
+#[test]
+fn huge_file_opens_in_fast_read_only_view() {
+    let text = make_text(HUGE_DOC_BYTES + 1024);
+    let mut h = Harness::new(text.clone());
+    h.app.reset_editor_state = true; // what loading a file does
+    let cold = h.frame(vec![]);
+    assert!(h.app.view_only, "large file should open in the view");
+    let idle = median((0..10).map(|_| h.frame(vec![])).collect());
+    println!("view: first frame {cold:.1} ms, idle {idle:.2} ms");
+    assert!(cold < 1000.0 && idle < 50.0);
+
+    // Typing does nothing in the read-only view.
+    h.frame(vec![egui::Event::Text("x".to_string())]);
+    assert_eq!(h.app.text, text);
+
+    // Find works and records the match for the view to show and scroll to.
+    let ctx = h.ctx.clone();
+    h.app.find_state.query = "line 4000:".to_string();
+    h.app.find_next(&ctx);
+    let (a, b) = h.app.view_match.expect("match recorded");
+    assert_eq!(&h.app.text[a..b], "line 4000:");
+    assert!(h.app.find_state.scroll_to_match);
+    h.frame(vec![]);
+    assert!(!h.app.find_state.scroll_to_match, "scroll request consumed");
+    h.app.find_state.highlight_all = true;
+    h.frame(vec![]);
+
+    // Replace is refused while read-only.
+    h.app.find_state.replace = "zzz".to_string();
+    h.app.replace_all();
+    assert_eq!(h.app.text, text);
+
+    // Overriding switches to the editor.
+    h.app.view_only = false;
+    h.frame(vec![]);
+    assert!(!h.app.view_only);
 }
