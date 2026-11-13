@@ -2088,6 +2088,14 @@ impl ScratchpadApp {
         paint_matches(ui, output, matches, color);
     }
 
+    /// Store `range` as the editor's selection without touching focus.
+    fn set_editor_selection_state(&self, ctx: &egui::Context, range: egui::text::CCursorRange) {
+        let editor_id = egui::Id::unique("editor");
+        let mut state = egui::TextEdit::load_state(ctx, editor_id).unwrap_or_default();
+        state.cursor.set_char_range(Some(range));
+        state.store(ctx, editor_id);
+    }
+
     /// Put the selection `range` into the editor and give it focus.
     fn set_editor_selection(&mut self, ctx: &egui::Context, range: egui::text::CCursorRange) {
         let editor_id = egui::Id::unique("editor");
@@ -2853,6 +2861,11 @@ impl ScratchpadApp {
                 self.apply_editor_action(ctx, action, selection);
             }
             let selection_before = self.last_selection;
+            // While the right-click menu is open, keep showing the selection it will act
+            // on (the click itself would otherwise move the cursor or select a line).
+            if let Some(range) = self.context_selection {
+                self.set_editor_selection_state(ctx, range);
+            }
             let show_line_numbers = self.settings.show_line_numbers;
 
             let font_id =
@@ -3027,6 +3040,13 @@ impl ScratchpadApp {
                             && ctx.input(|i| i.pointer.secondary_pressed())
                         {
                             self.context_selection = selection_before;
+                            if let Some(range) = selection_before {
+                                // The press already moved the cursor this frame; put the
+                                // old selection back and redraw.
+                                self.set_editor_selection_state(ctx, range);
+                                self.last_selection = Some(range);
+                                ctx.request_repaint();
+                            }
                         }
                         let mut chosen = None;
                         output.response.context_menu(|ui| {
