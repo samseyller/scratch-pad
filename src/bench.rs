@@ -239,3 +239,73 @@ fn huge_file_opens_in_fast_read_only_view() {
     h.frame(vec![]);
     assert!(!h.app.view_only);
 }
+
+#[test]
+fn encodings_detect_and_roundtrip() {
+    let text = "héllo wörld\nline two ✓\n";
+    for enc in [TextEncoding::Utf8, TextEncoding::Utf16Le, TextEncoding::Utf16Be] {
+        let bytes = encode_text(text, enc);
+        let (detected, bom) = detect_encoding(&bytes);
+        assert_eq!(detected, if enc == TextEncoding::Utf8 { TextEncoding::Utf8 } else { enc });
+        assert_eq!(decode_bytes(&bytes[bom..], detected).unwrap(), text, "{enc:?}");
+    }
+    // UTF-8 BOM is recognised and stripped.
+    assert_eq!(detect_encoding(&[0xEF, 0xBB, 0xBF, b'a']), (TextEncoding::Utf8, 3));
+    // BOM-less ASCII UTF-16 is detected from where the zero bytes fall.
+    assert_eq!(detect_encoding(b"a\0b\0c\0").0, TextEncoding::Utf16Le);
+    assert_eq!(detect_encoding(b"\0a\0b\0c").0, TextEncoding::Utf16Be);
+    assert_eq!(detect_encoding(b"plain ascii").0, TextEncoding::Utf8);
+    // Bad data is an error, not a panic.
+    assert!(decode_bytes(&[0x00], TextEncoding::Utf16Le).is_err());
+    assert!(decode_bytes(&[0xFF, 0xFE, 0xFD], TextEncoding::Utf8).is_err());
+}
+
+#[test]
+fn utf16_file_roundtrip_on_disk() {
+    let dir = std::env::temp_dir().join("scratchpad-test-utf16");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("u16.txt");
+    let mut app = ScratchpadApp::default();
+    app.encoding = TextEncoding::Utf16Le;
+    app.line_ending = LineEnding::CrLf;
+    app.write_text_with_encoding(&path, "a\nb\n").unwrap();
+    let (text, le, enc) = ScratchpadApp::read_text_with_encoding(&path).unwrap();
+    assert_eq!((text.as_str(), le, enc), ("a\nb\n", LineEnding::CrLf, TextEncoding::Utf16Le));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn open_filter_from_extension() {
+    assert_eq!(OpenFilter::from_extension("RS"), Some(OpenFilter::SourceCode));
+    assert_eq!(OpenFilter::from_extension("md"), Some(OpenFilter::Text));
+    assert_eq!(OpenFilter::from_extension("json"), Some(OpenFilter::ConfigData));
+    assert_eq!(OpenFilter::from_extension("zzz"), None);
+    let mut app = ScratchpadApp::default();
+    app.update_last_open_filter(Path::new("a.csv"));
+    assert_eq!(app.last_open_filter, OpenFilter::StructuredData);
+    app.update_last_open_filter(Path::new("noext"));
+    assert_eq!(app.last_open_filter, OpenFilter::AllFiles);
+}
+
+#[test]
+fn editor_actions_edit_the_selection() {
+    use egui::text::{CCursor, CCursorRange};
+    let sel = |a, b| Some(CCursorRange::two(CCursor::new(a), CCursor::new(b)));
+    let mut h = Harness::new("héllo wORLD foo".to_string());
+    let ctx = h.ctx.clone();
+    h.frame(vec![]);
+    let run = |h: &mut Harness, action, s| {
+        h.app.apply_editor_action(&ctx, action, s);
+        h.frame(vec![]);
+        h.app.text.clone()
+    };
+    assert_eq!(run(&mut h, EditorAction::Uppercase, sel(0, 5)), "HÉLLO wORLD foo");
+    assert_eq!(run(&mut h, EditorAction::Lowercase, sel(0, 5)), "héllo wORLD foo");
+    assert_eq!(run(&mut h, EditorAction::Propercase, sel(6, 11)), "héllo World foo");
+    assert_eq!(run(&mut h, EditorAction::Delete, sel(5, 11)), "héllo foo");
+    assert_eq!(run(&mut h, EditorAction::Cut, sel(0, 6)), "foo");
+    // A bare cursor (empty selection) changes nothing.
+    assert_eq!(run(&mut h, EditorAction::Delete, sel(1, 1)), "foo");
+    assert_eq!(h.app.derived().stats.chars, 3, "revision counter updated");
+    assert_eq!(to_proper_case("hELLO wORLD-foo_bar"), "Hello World-Foo_Bar");
+}

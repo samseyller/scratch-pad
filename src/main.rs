@@ -90,6 +90,175 @@ impl ThemeSetting {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenFilter {
+    Text,
+    ConfigData,
+    SourceCode,
+    WebFiles,
+    StructuredData,
+    AllFiles,
+}
+
+impl OpenFilter {
+    fn all() -> [(OpenFilter, &'static str, &'static [&'static str]); 6] {
+        [
+            (OpenFilter::Text, "Text Files", &["txt", "log", "md", "rst", "adoc"]),
+            (
+                OpenFilter::ConfigData,
+                "Config & Data",
+                &["json", "yaml", "yml", "toml", "ini", "cfg", "ron"],
+            ),
+            (
+                OpenFilter::SourceCode,
+                "Source Code",
+                &["rs", "c", "cpp", "cs", "java", "py", "js", "ts", "go"],
+            ),
+            (OpenFilter::WebFiles, "Web Files", &["html", "css", "js", "ts"]),
+            (OpenFilter::StructuredData, "Structured Data", &["csv", "xml"]),
+            (OpenFilter::AllFiles, "All Files", &["*"]),
+        ]
+    }
+
+    fn from_extension(ext: &str) -> Option<Self> {
+        Self::all()
+            .into_iter()
+            .find(|(_, _, exts)| exts.iter().any(|e| e.eq_ignore_ascii_case(ext)))
+            .map(|(filter, _, _)| filter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextEncoding {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+}
+
+impl TextEncoding {
+    fn label(self) -> &'static str {
+        match self {
+            TextEncoding::Utf8 => "UTF-8",
+            TextEncoding::Utf16Le => "UTF-16 LE",
+            TextEncoding::Utf16Be => "UTF-16 BE",
+        }
+    }
+}
+
+/// Edits offered by the right-click menu and the Edit menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorAction {
+    Copy,
+    Cut,
+    Delete,
+    Paste,
+    SelectAll,
+    Uppercase,
+    Lowercase,
+    Propercase,
+}
+
+const EDITOR_MENU_ITEMS: [(&str, EditorAction); 8] = [
+    ("Copy (Ctrl+C)", EditorAction::Copy),
+    ("Cut (Ctrl+X)", EditorAction::Cut),
+    ("Delete (Del)", EditorAction::Delete),
+    ("Paste (Ctrl+V)", EditorAction::Paste),
+    ("Select All (Ctrl+A)", EditorAction::SelectAll),
+    ("UPPERCASE", EditorAction::Uppercase),
+    ("lowercase", EditorAction::Lowercase),
+    ("Propercase", EditorAction::Propercase),
+];
+
+fn decode_bytes(bytes: &[u8], encoding: TextEncoding) -> Result<String, String> {
+    let utf16 = |from: fn([u8; 2]) -> u16| -> Result<String, String> {
+        if bytes.len() % 2 != 0 {
+            return Err(format!("{} data has an odd number of bytes.", encoding.label()));
+        }
+        let units: Vec<u16> = bytes.chunks_exact(2).map(|c| from([c[0], c[1]])).collect();
+        String::from_utf16(&units).map_err(|e| e.to_string())
+    };
+    match encoding {
+        TextEncoding::Utf8 => std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|e| e.to_string()),
+        TextEncoding::Utf16Le => utf16(u16::from_le_bytes),
+        TextEncoding::Utf16Be => utf16(u16::from_be_bytes),
+    }
+}
+
+/// Detect the encoding from a byte-order mark or, failing that, from where the zero
+/// bytes of mostly-ASCII UTF-16 text fall. Returns the encoding and the BOM length.
+fn detect_encoding(bytes: &[u8]) -> (TextEncoding, usize) {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return (TextEncoding::Utf8, 3);
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return (TextEncoding::Utf16Le, 2);
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return (TextEncoding::Utf16Be, 2);
+    }
+    let (mut even_zeros, mut odd_zeros) = (0usize, 0usize);
+    for (i, b) in bytes.iter().enumerate().take(64 * 1024) {
+        if *b == 0 {
+            if i % 2 == 0 {
+                even_zeros += 1;
+            } else {
+                odd_zeros += 1;
+            }
+        }
+    }
+    if odd_zeros > even_zeros * 2 {
+        (TextEncoding::Utf16Le, 0)
+    } else if even_zeros > odd_zeros * 2 {
+        (TextEncoding::Utf16Be, 0)
+    } else {
+        (TextEncoding::Utf8, 0)
+    }
+}
+
+/// Encode text for saving. UTF-16 files get a byte-order mark.
+fn encode_text(contents: &str, encoding: TextEncoding) -> Vec<u8> {
+    match encoding {
+        TextEncoding::Utf8 => contents.as_bytes().to_vec(),
+        TextEncoding::Utf16Le => {
+            let mut out = vec![0xFF, 0xFE];
+            out.extend(contents.encode_utf16().flat_map(|u| u.to_le_bytes()));
+            out
+        }
+        TextEncoding::Utf16Be => {
+            let mut out = vec![0xFE, 0xFF];
+            out.extend(contents.encode_utf16().flat_map(|u| u.to_be_bytes()));
+            out
+        }
+    }
+}
+
+fn to_proper_case(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut new_word = true;
+    for ch in text.chars() {
+        if ch.is_alphabetic() {
+            if new_word {
+                out.extend(ch.to_uppercase());
+            } else {
+                out.extend(ch.to_lowercase());
+            }
+            new_word = false;
+        } else {
+            out.push(ch);
+            new_word = true;
+        }
+    }
+    out
+}
+
+fn char_index_to_byte(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum HighlightMode {
     Off,
@@ -106,6 +275,7 @@ struct AppSettings {
     recent_files: Vec<String>,
     word_wrap: bool,
     highlight_mode: HighlightMode,
+    always_on_top: bool,
     check_updates: bool,
     watch_file_changes: bool,
     theme: ThemeSetting,
@@ -120,6 +290,7 @@ impl Default for AppSettings {
             recent_files: Vec::new(),
             word_wrap: true,
             highlight_mode: HighlightMode::Syntax,
+            always_on_top: false,
             check_updates: true,
             watch_file_changes: true,
             theme: ThemeSetting::Auto,
@@ -230,6 +401,57 @@ fn build_line_starts(text: &str) -> (Vec<usize>, usize) {
     }
     max_len = max_len.max(text.len() - prev);
     (starts, max_len.min(VIEW_MAX_COLS))
+}
+
+/// Shade `matches` (sorted char ranges) in the visible rows of the editor. This works
+/// from the row list (binary search plus a running char count) because
+/// Galley::cursor_from_pos / pos_from_cursor walk the whole galley, which costs tens of
+/// milliseconds per frame on huge documents.
+fn paint_matches(
+    ui: &egui::Ui,
+    output: &TextEditOutput,
+    matches: &[FindMatch],
+    color: egui::Color32,
+) {
+    let clip = ui.clip_rect();
+    let origin = output.galley_pos.to_vec2();
+    let rows = &output.galley.rows;
+    let first_row = rows.partition_point(|r| r.rect().max.y + origin.y < clip.min.y);
+    let end_row = rows.partition_point(|r| r.rect().min.y + origin.y <= clip.max.y);
+    if first_row >= end_row {
+        return;
+    }
+    let mut row_start: usize = rows[..first_row]
+        .iter()
+        .map(|r| usize::from(r.char_count_including_newline()))
+        .sum();
+
+    let painter = ui.painter_at(output.text_clip_rect);
+    for row in &rows[first_row..end_row] {
+        let row_end = row_start + usize::from(row.char_count_excluding_newline());
+        let next_start = row_start + usize::from(row.char_count_including_newline());
+        let first_match = matches.partition_point(|m| m.end_char <= row_start);
+        for m in matches[first_match..]
+            .iter()
+            .take_while(|m| m.start_char < next_start)
+        {
+            // Clip the match to this row's text (a match can span several rows).
+            let s = m.start_char.max(row_start);
+            let e = m.end_char.min(row_end);
+            if e <= s {
+                continue;
+            }
+            let x0 = row.x_offset((s - row_start).into());
+            let x1 = row.x_offset((e - row_start).into());
+            let r = row.rect();
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(r.min.x + x0, r.min.y),
+                egui::pos2(r.min.x + x1, r.max.y),
+            );
+            painter.rect_filled(rect.translate(origin), 0.0, color);
+        }
+        row_start = next_start;
+    }
 }
 
 fn find_matches_in(text: &str, regex: &Regex) -> Vec<FindMatch> {
@@ -400,6 +622,25 @@ struct ScratchpadApp {
     /// Clear editor selection/state on the next frame (after New/Open).
     reset_editor_state: bool,
 
+    /// Current encoding for load/save.
+    encoding: TextEncoding,
+
+    /// Last selected filter in the Open dialog (per session).
+    last_open_filter: OpenFilter,
+
+    applied_always_on_top: bool,
+
+    /// Selection (possibly just a cursor) as of the last frame the editor had focus.
+    /// Menus take focus away from the editor, so actions use this.
+    last_selection: Option<egui::text::CCursorRange>,
+    /// Selection captured when the right-click menu was opened.
+    context_selection: Option<egui::text::CCursorRange>,
+    /// Action chosen in the right-click menu, applied at the start of the next frame.
+    pending_editor_action: Option<(EditorAction, Option<egui::text::CCursorRange>)>,
+
+    /// Result of the background file-modification check.
+    file_mtime_rx: Option<Receiver<(PathBuf, Option<SystemTime>)>>,
+
     /// Large files open in a read-only view that lays out only the visible lines.
     view_only: bool,
     /// Byte range of the match Find last selected, shown in the large-file view.
@@ -453,6 +694,13 @@ impl Default for ScratchpadApp {
             request_editor_focus: true,
             reset_editor_state: false,
             view_only: false,
+            encoding: TextEncoding::Utf8,
+            last_open_filter: OpenFilter::Text,
+            applied_always_on_top: false,
+            last_selection: None,
+            context_selection: None,
+            pending_editor_action: None,
+            file_mtime_rx: None,
             view_match: None,
             line_index: None,
             confirm_edit_open: false,
@@ -554,6 +802,31 @@ impl ScratchpadApp {
         }
     }
 
+    /// Read a file, detecting its encoding (BOM or UTF-16 heuristics) and line endings.
+    fn read_text_with_encoding(path: &Path) -> Result<(String, LineEnding, TextEncoding), String> {
+        let bytes = fs::read(path).map_err(|e| e.to_string())?;
+        let (encoding, bom_len) = detect_encoding(&bytes);
+        let text = decode_bytes(&bytes[bom_len..], encoding)?;
+        let (normalized, line_ending) = Self::normalize_line_endings(&text);
+        Ok((normalized, line_ending, encoding))
+    }
+
+    fn write_text_with_encoding(&self, path: &Path, contents: &str) -> std::io::Result<()> {
+        let contents = self.apply_line_ending(contents);
+        fs::write(path, encode_text(&contents, self.encoding))
+    }
+
+    /// Load a file into the buffer; shared by Open, Open Recent, drop and reload.
+    fn load_file_into_buffer(&mut self, path: &Path) -> Result<(), String> {
+        let (normalized, line_ending, encoding) = Self::read_text_with_encoding(path)?;
+        self.text = normalized;
+        self.saved_snapshot = self.text.clone();
+        self.touch();
+        self.line_ending = line_ending;
+        self.encoding = encoding;
+        Ok(())
+    }
+
     /// Start a new, empty document.
     fn do_new_file(&mut self) {
         self.text.clear();
@@ -561,6 +834,7 @@ impl ScratchpadApp {
         self.touch();
         self.file_path = None;
         self.line_ending = LineEnding::Lf;
+        self.encoding = TextEncoding::Utf8;
         self.last_file_mtime = None;
         self.clear_error();
         self.request_editor_focus = true;
@@ -571,30 +845,15 @@ impl ScratchpadApp {
     fn do_open_file(&mut self) {
         self.clear_error();
 
-        let picked = rfd::FileDialog::new()
-            .add_filter("Text Files", &["txt", "log", "md", "rst", "adoc"])
-            .add_filter("Config & Data", &["json", "yaml", "yml", "toml", "ini", "cfg", "ron"])
-            .add_filter(
-                "Source Code",
-                &["rs", "c", "cpp", "cs", "java", "py", "js", "ts", "go"],
-            )
-            .add_filter("Web Files", &["html", "css", "js", "ts"])
-            .add_filter("Structured Data", &["csv", "xml"])
-            .add_filter("All Files", &["*"])
-            .pick_file();
-
-        let Some(path) = picked else {
+        let Some(path) = self.pick_open_file() else {
             // User canceled.
             return;
         };
 
-        match fs::read_to_string(&path) {
-            Ok(contents) => {
-                let (normalized, line_ending) = Self::normalize_line_endings(&contents);
-                self.text = normalized;
-                self.saved_snapshot = self.text.clone();
-                self.touch();
-                self.line_ending = line_ending;
+        self.update_last_open_filter(&path);
+
+        match self.load_file_into_buffer(&path) {
+            Ok(()) => {
                 self.push_recent(&path);
                 self.file_path = Some(path);
                 self.last_file_mtime = Self::read_file_mtime(&self.file_path);
@@ -605,17 +864,53 @@ impl ScratchpadApp {
         }
     }
 
+    /// The Open dialog, with the filter used last time listed first.
+    fn pick_open_file(&self) -> Option<PathBuf> {
+        let mut dialog = rfd::FileDialog::new();
+        for (filter, name, extensions) in OpenFilter::all() {
+            if filter == self.last_open_filter {
+                dialog = dialog.add_filter(name, extensions);
+            }
+        }
+        for (filter, name, extensions) in OpenFilter::all() {
+            if filter != self.last_open_filter {
+                dialog = dialog.add_filter(name, extensions);
+            }
+        }
+        dialog.pick_file()
+    }
+
+    fn update_last_open_filter(&mut self, path: &Path) {
+        self.last_open_filter = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(OpenFilter::from_extension)
+            .unwrap_or(OpenFilter::AllFiles);
+    }
+
+    /// Launch another copy of the app showing `path`.
+    fn open_in_new_window(&mut self, path: PathBuf) {
+        self.update_last_open_filter(&path);
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(err) => {
+                self.set_error(format!("Failed to launch new window: {err}"));
+                return;
+            }
+        };
+        if let Err(err) = std::process::Command::new(exe).arg(path).spawn() {
+            self.set_error(format!("Failed to launch new window: {err}"));
+        }
+    }
+
     /// Open a specific file path (e.g. from drag-and-drop).
     fn do_open_path(&mut self, path: PathBuf) {
         self.clear_error();
 
-        match fs::read_to_string(&path) {
-            Ok(contents) => {
-                let (normalized, line_ending) = Self::normalize_line_endings(&contents);
-                self.text = normalized;
-                self.saved_snapshot = self.text.clone();
-                self.touch();
-                self.line_ending = line_ending;
+        self.update_last_open_filter(&path);
+
+        match self.load_file_into_buffer(&path) {
+            Ok(()) => {
                 self.push_recent(&path);
                 self.file_path = Some(path);
                 self.last_file_mtime = Self::read_file_mtime(&self.file_path);
@@ -645,8 +940,7 @@ impl ScratchpadApp {
             return;
         };
 
-        let contents = self.apply_line_ending(&self.text);
-        if let Err(e) = write_all_text(&path, &contents) {
+        if let Err(e) = self.write_text_with_encoding(&path, &self.text) {
             self.set_error(format!("Failed to save file: {e}"));
             return;
         }
@@ -672,8 +966,7 @@ impl ScratchpadApp {
             return;
         };
 
-        let contents = self.apply_line_ending(&self.text);
-        if let Err(e) = write_all_text(&path, &contents) {
+        if let Err(e) = self.write_text_with_encoding(&path, &self.text) {
             self.set_error(format!("Failed to save file: {e}"));
             return;
         }
@@ -712,49 +1005,113 @@ impl ScratchpadApp {
         if self.file_path.is_none() {
             return;
         }
+        // Collect the result of the background check started on an earlier frame.
+        if let Some(rx) = &self.file_mtime_rx {
+            match rx.try_recv() {
+                Ok((checked_path, modified)) => {
+                    self.file_mtime_rx = None;
+                    if Some(&checked_path) == self.file_path.as_ref() {
+                        if let Some(modified) = modified {
+                            match self.last_file_mtime {
+                                Some(last) if modified > last => {
+                                    self.file_change_prompt_open = true;
+                                }
+                                Some(_) => {}
+                                None => self.last_file_mtime = Some(modified),
+                            }
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.file_mtime_rx = None,
+            }
+        }
+
         // Wake an otherwise idle window periodically so external edits are noticed,
-        // but only touch the file system once per interval, not once per frame.
+        // but only look at the file once per interval, and off the UI thread so a slow
+        // or network drive can't freeze the window.
         ctx.request_repaint_after(FILE_CHECK_INTERVAL);
+        if self.file_change_prompt_open || self.file_mtime_rx.is_some() {
+            return;
+        }
         let now = Instant::now();
         if !should_check_file(self.last_file_check, now, FILE_CHECK_INTERVAL) {
             return;
         }
         self.last_file_check = Some(now);
-        let Some(path) = &self.file_path else {
+        let Some(path) = self.file_path.clone() else {
             return;
         };
-        let Ok(metadata) = fs::metadata(path) else {
-            return;
-        };
-        let Ok(modified) = metadata.modified() else {
-            return;
-        };
-        if let Some(last) = self.last_file_mtime {
-            if modified > last {
-                self.file_change_prompt_open = true;
-            }
-        } else {
-            self.last_file_mtime = Some(modified);
-        }
+        let (tx, rx) = mpsc::channel();
+        self.file_mtime_rx = Some(rx);
+        let repaint = ctx.clone();
+        thread::spawn(move || {
+            let modified = fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let _ = tx.send((path, modified));
+            repaint.request_repaint();
+        });
     }
 
     fn reload_from_disk(&mut self) {
-        let Some(path) = &self.file_path else {
+        let Some(path) = self.file_path.clone() else {
             return;
         };
-        match fs::read_to_string(path) {
-            Ok(contents) => {
-                let (normalized, line_ending) = Self::normalize_line_endings(&contents);
-                self.text = normalized;
-                self.saved_snapshot = self.text.clone();
-                self.touch();
-                self.line_ending = line_ending;
+        match self.load_file_into_buffer(&path) {
+            Ok(()) => {
                 self.last_file_mtime = Self::read_file_mtime(&self.file_path);
                 self.request_editor_focus = true;
                 self.reset_editor_state = true;
             }
             Err(e) => self.set_error(format!("Failed to reload file: {e}")),
         }
+    }
+
+    /// Switch the encoding. With a clean file this re-reads it as the chosen encoding
+    /// (to fix a wrong guess); with unsaved changes it only sets the encoding for the
+    /// next save.
+    fn apply_encoding_selection(&mut self, encoding: TextEncoding) {
+        if self.is_dirty() || self.file_path.is_none() {
+            self.encoding = encoding;
+            if self.is_dirty() {
+                self.set_error("Unsaved changes: encoding set for next save.");
+            }
+            return;
+        }
+        let Some(path) = self.file_path.clone() else {
+            return;
+        };
+        let mut bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.set_error(format!("Failed to reload file: {e}"));
+                return;
+            }
+        };
+        let (_, bom_len) = detect_encoding(&bytes);
+        let bom_matches = match encoding {
+            TextEncoding::Utf8 => bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+            TextEncoding::Utf16Le => bytes.starts_with(&[0xFF, 0xFE]),
+            TextEncoding::Utf16Be => bytes.starts_with(&[0xFE, 0xFF]),
+        };
+        if bom_matches {
+            bytes.drain(0..bom_len);
+        }
+        let text = match decode_bytes(&bytes, encoding) {
+            Ok(text) => text,
+            Err(e) => {
+                self.set_error(format!("Failed to reload file: {e}"));
+                return;
+            }
+        };
+        let (normalized, line_ending) = Self::normalize_line_endings(&text);
+        self.text = normalized;
+        self.saved_snapshot = self.text.clone();
+        self.touch();
+        self.line_ending = line_ending;
+        self.encoding = encoding;
+        self.last_file_mtime = Self::read_file_mtime(&self.file_path);
+        self.request_editor_focus = true;
+        self.reset_editor_state = true;
     }
 
     fn start_update_check(&mut self, ctx: egui::Context) {
@@ -861,6 +1218,7 @@ impl ScratchpadApp {
             LineEnding::Lf => "LF",
             LineEnding::CrLf => "CRLF",
         };
+        let encoding = self.encoding.label();
 
         let selection_text = if selection_len > 0 {
             format!("  |  Sel: {selection_len}")
@@ -881,7 +1239,7 @@ impl ScratchpadApp {
         };
 
         format!(
-            "{name}{dirty}  |  Ln {line}, Col {col}  |  Lines: {lines}  Chars: {chars}  |  Size: {size_text}  |  {line_ending}{selection_text}"
+            "{name}{dirty}  |  Ln {line}, Col {col}  |  Lines: {lines}  Chars: {chars}  |  Size: {size_text}  |  {line_ending}  |  {encoding}{selection_text}"
         )
         + huge_text
         + &update_text
@@ -1077,6 +1435,16 @@ impl ScratchpadApp {
         ));
         state.store(ctx, editor_id);
         self.undo_capped = large;
+    }
+
+    fn apply_window_level(&mut self, ctx: &egui::Context) {
+        let level = if self.settings.always_on_top {
+            egui::viewport::WindowLevel::AlwaysOnTop
+        } else {
+            egui::viewport::WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        self.applied_always_on_top = self.settings.always_on_top;
     }
 
     fn apply_font_settings(&self, ctx: &egui::Context) {
@@ -1711,53 +2079,112 @@ impl ScratchpadApp {
             return;
         }
 
-        // Paint only the visible rows. This works from the row list (binary search plus
-        // a running char count) because Galley::cursor_from_pos / pos_from_cursor walk the
-        // whole galley, which costs tens of milliseconds per frame on huge documents.
-        let clip = ui.clip_rect();
-        let origin = output.galley_pos.to_vec2();
-        let rows = &output.galley.rows;
-        let first_row = rows.partition_point(|r| r.rect().max.y + origin.y < clip.min.y);
-        let end_row = rows.partition_point(|r| r.rect().min.y + origin.y <= clip.max.y);
-        if first_row >= end_row {
-            return;
-        }
-        let mut row_start: usize = rows[..first_row]
-            .iter()
-            .map(|r| usize::from(r.char_count_including_newline()))
-            .sum();
-
-        let painter = ui.painter_at(output.text_clip_rect);
         // Translucent so the text underneath stays readable in both themes.
         let color = if ui.visuals().dark_mode {
             egui::Color32::from_rgba_unmultiplied(255, 200, 40, 70)
         } else {
             egui::Color32::from_rgba_unmultiplied(255, 190, 0, 90)
         };
-        for row in &rows[first_row..end_row] {
-            let row_end = row_start + usize::from(row.char_count_excluding_newline());
-            let next_start = row_start + usize::from(row.char_count_including_newline());
-            let first_match = matches.partition_point(|m| m.end_char <= row_start);
-            for m in matches[first_match..]
-                .iter()
-                .take_while(|m| m.start_char < next_start)
-            {
-                // Clip the match to this row's text (a match can span several rows).
-                let s = m.start_char.max(row_start);
-                let e = m.end_char.min(row_end);
-                if e <= s {
-                    continue;
-                }
-                let x0 = row.x_offset((s - row_start).into());
-                let x1 = row.x_offset((e - row_start).into());
-                let r = row.rect();
-                let rect = egui::Rect::from_min_max(
-                    egui::pos2(r.min.x + x0, r.min.y),
-                    egui::pos2(r.min.x + x1, r.max.y),
-                );
-                painter.rect_filled(rect.translate(origin), 0.0, color);
+        paint_matches(ui, output, matches, color);
+    }
+
+    /// Put the selection `range` into the editor and give it focus.
+    fn set_editor_selection(&mut self, ctx: &egui::Context, range: egui::text::CCursorRange) {
+        let editor_id = egui::Id::unique("editor");
+        let mut state = egui::TextEdit::load_state(ctx, editor_id).unwrap_or_default();
+        state.cursor.set_char_range(Some(range));
+        state.store(ctx, editor_id);
+        ctx.memory_mut(|mem| mem.request_focus(editor_id));
+        self.request_editor_focus = true;
+    }
+
+    /// Apply a menu action to `selection` (the editor's selection when the menu opened;
+    /// menus take focus, so it can't be read from the editor itself).
+    fn apply_editor_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: EditorAction,
+        selection: Option<egui::text::CCursorRange>,
+    ) {
+        use egui::text::{CCursor, CCursorRange};
+        if action == EditorAction::SelectAll {
+            let len = self.text.chars().count();
+            self.set_editor_selection(ctx, CCursorRange::two(CCursor::new(0), CCursor::new(len)));
+            return;
+        }
+        let Some(range) = selection else {
+            if action == EditorAction::Paste {
+                self.paste_from_clipboard(ctx);
             }
-            row_start = next_start;
+            return;
+        };
+        let [min, max] = range.sorted_cursors();
+        let (start, end) = (usize::from(min.index), usize::from(max.index));
+        let start_byte = char_index_to_byte(&self.text, start);
+        let end_byte = char_index_to_byte(&self.text, end);
+        let has_selection = end > start;
+
+        // Replace the selected text, then select `new_len` chars (0 = just a cursor).
+        let replace = |app: &mut Self, with: &str, select: bool| {
+            app.text.replace_range(start_byte..end_byte, with);
+            app.touch();
+            let len = with.chars().count();
+            let range = if select {
+                CCursorRange::two(CCursor::new(start), CCursor::new(start + len))
+            } else {
+                CCursorRange::one(CCursor::new(start + len))
+            };
+            app.set_editor_selection(ctx, range);
+        };
+
+        match action {
+            EditorAction::Copy if has_selection => {
+                let selected = self.text[start_byte..end_byte].to_string();
+                self.copy_to_clipboard(&selected);
+            }
+            EditorAction::Cut if has_selection => {
+                let selected = self.text[start_byte..end_byte].to_string();
+                self.copy_to_clipboard(&selected);
+                replace(self, "", false);
+            }
+            EditorAction::Delete if has_selection => replace(self, "", false),
+            EditorAction::Paste => {
+                if let Some(insert) = self.read_clipboard_text() {
+                    replace(self, &insert.replace("\r\n", "\n"), false);
+                }
+            }
+            EditorAction::Uppercase if has_selection => {
+                let out = self.text[start_byte..end_byte].to_uppercase();
+                replace(self, &out, true);
+            }
+            EditorAction::Lowercase if has_selection => {
+                let out = self.text[start_byte..end_byte].to_lowercase();
+                replace(self, &out, true);
+            }
+            EditorAction::Propercase if has_selection => {
+                let out = to_proper_case(&self.text[start_byte..end_byte]);
+                replace(self, &out, true);
+            }
+            _ => {}
+        }
+    }
+
+    fn copy_to_clipboard(&mut self, text: &str) {
+        if let Err(e) =
+            Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string()))
+        {
+            self.set_error(format!("Clipboard copy failed: {e}"));
+        }
+    }
+
+    fn read_clipboard_text(&mut self) -> Option<String> {
+        match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+            Ok(text) if !text.is_empty() => Some(text),
+            Ok(_) => None,
+            Err(e) => {
+                self.set_error(format!("Clipboard paste failed: {e}"));
+                None
+            }
         }
     }
 
@@ -1797,6 +2224,9 @@ impl ScratchpadApp {
         let ctx = root_ui.ctx().clone();
         let ctx = &ctx;
         self.apply_font_settings(ctx);
+        if self.applied_always_on_top != self.settings.always_on_top {
+            self.apply_window_level(ctx);
+        }
         self.poll_update_check();
         let mut open_find = false;
         let mut open_replace = false;
@@ -1912,6 +2342,13 @@ impl ScratchpadApp {
                         self.handle_command(PendingAction::OpenFile);
                     }
 
+                    if ui.button("Open in New Window...").clicked() {
+                        ui.close();
+                        if let Some(path) = self.pick_open_file() {
+                            self.open_in_new_window(path);
+                        }
+                    }
+
                     ui.menu_button("Recent", |ui| {
                         let mut to_open: Option<PathBuf> = None;
                         let mut remove_entry: Option<String> = None;
@@ -1983,6 +2420,11 @@ impl ScratchpadApp {
                         self.send_editor_event(ctx, egui::Event::Cut);
                     }
 
+                    if ui.button("Delete (Del)").clicked() {
+                        ui.close();
+                        self.apply_editor_action(ctx, EditorAction::Delete, self.last_selection);
+                    }
+
                     if ui.button("Paste (Ctrl+V)").clicked() {
                         ui.close();
                         self.paste_from_clipboard(ctx);
@@ -2000,6 +2442,14 @@ impl ScratchpadApp {
                                 modifiers: egui::Modifiers::COMMAND,
                             },
                         );
+                    }
+
+                    ui.separator();
+                    for (label, action) in &EDITOR_MENU_ITEMS[5..] {
+                        if ui.button(*label).clicked() {
+                            ui.close();
+                            self.apply_editor_action(ctx, *action, self.last_selection);
+                        }
                     }
 
                     ui.separator();
@@ -2066,6 +2516,12 @@ impl ScratchpadApp {
                     changed |= ui
                         .checkbox(&mut self.settings.word_wrap, "Word wrap")
                         .changed();
+                    if ui
+                        .checkbox(&mut self.settings.always_on_top, "Always on top")
+                        .changed()
+                    {
+                        self.apply_window_level(ctx);
+                    }
                     ui.separator();
                     ui.label("Theme");
                     changed |= ui
@@ -2098,6 +2554,23 @@ impl ScratchpadApp {
                         .changed();
                     if changed {
                         self.apply_font_settings(ctx);
+                    }
+                });
+
+                ui.menu_button("Encoding", |ui| {
+                    for encoding in [
+                        TextEncoding::Utf8,
+                        TextEncoding::Utf16Le,
+                        TextEncoding::Utf16Be,
+                    ] {
+                        let mut selected = self.encoding;
+                        if ui
+                            .radio_value(&mut selected, encoding, encoding.label())
+                            .clicked()
+                        {
+                            ui.close();
+                            self.apply_encoding_selection(encoding);
+                        }
                     }
                 });
 
@@ -2376,6 +2849,10 @@ impl ScratchpadApp {
                 return;
             }
             self.update_undo_limit(ctx, editor_id);
+            if let Some((action, selection)) = self.pending_editor_action.take() {
+                self.apply_editor_action(ctx, action, selection);
+            }
+            let selection_before = self.last_selection;
             let show_line_numbers = self.settings.show_line_numbers;
 
             let font_id =
@@ -2521,6 +2998,58 @@ impl ScratchpadApp {
                             self.paint_find_highlights(ui, &output);
                         }
 
+                        // Menus take focus away from the editor, so remember the
+                        // selection as it was the last time the editor had focus.
+                        if output.response.has_focus() {
+                            self.last_selection = output.cursor_range;
+                        }
+
+                        // While the Find window has focus the editor shows no selection;
+                        // keep showing the current match.
+                        if self.find_state.open && !output.response.has_focus() {
+                            if let Some((start, end)) = self.find_state.last_found {
+                                if self.current_selection_char_range(ctx) == Some((start, end)) {
+                                    let m = FindMatch {
+                                        start_byte: 0,
+                                        end_byte: 0,
+                                        start_char: start,
+                                        end_char: end,
+                                    };
+                                    let color = egui::Color32::from_rgba_unmultiplied(255, 140, 0, 110);
+                                    paint_matches(ui, &output, &[m], color);
+                                }
+                            }
+                        }
+
+                        // Right-click menu. The selection is captured when the button goes
+                        // down, before the press can move the cursor.
+                        if output.response.hovered()
+                            && ctx.input(|i| i.pointer.secondary_pressed())
+                        {
+                            self.context_selection = selection_before;
+                        }
+                        let mut chosen = None;
+                        output.response.context_menu(|ui| {
+                            ui.set_min_width(170.0);
+                            for (idx, (label, action)) in EDITOR_MENU_ITEMS.iter().enumerate() {
+                                if idx == 5 {
+                                    ui.separator();
+                                }
+                                if ui.button(*label).clicked() {
+                                    chosen = Some(*action);
+                                    ui.close();
+                                }
+                            }
+                        });
+                        if let Some(action) = chosen {
+                            self.pending_editor_action = Some((action, self.context_selection));
+                        }
+                        if !output.response.context_menu_opened()
+                            && !ctx.input(|i| i.pointer.secondary_down())
+                        {
+                            self.context_selection = None;
+                        }
+
                         output.response.clone()
                     })
                     .inner
@@ -2549,7 +3078,11 @@ impl ScratchpadApp {
         });
 
         if let Some(path) = dropped_paths.into_iter().next() {
-            self.maybe_defer_or_run(PendingAction::OpenPath(path));
+            if self.file_path.is_some() || !self.text.is_empty() {
+                self.open_in_new_window(path);
+            } else {
+                self.maybe_defer_or_run(PendingAction::OpenPath(path));
+            }
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -2767,9 +3300,6 @@ fn replace_all_text(regex: &Regex, text: &str, replacement: &str, literal: bool)
     }
 }
 
-fn write_all_text(path: &Path, contents: &str) -> std::io::Result<()> {
-    fs::write(path, contents)
-}
 
 fn make_app_icon() -> egui::IconData {
     let size = 64u32;
