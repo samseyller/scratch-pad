@@ -1,10 +1,10 @@
 #![windows_subsystem = "windows"]
 
-use std::collections::hash_map::DefaultHasher;
+use std::cell::{Cell, RefCell};
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
@@ -163,11 +163,6 @@ fn flush_plain(
     }
 }
 
-/// Number of logical lines (always at least 1).
-fn count_lines(text: &str) -> usize {
-    text.bytes().filter(|&b| b == b'\n').count() + 1
-}
-
 /// 1-based (line, column) for a cursor at `char_idx`, without allocating.
 fn cursor_line_col(text: &str, char_idx: usize) -> (usize, usize) {
     let byte = text
@@ -202,17 +197,58 @@ fn find_matches_in(text: &str, regex: &Regex) -> Vec<FindMatch> {
     out
 }
 
-fn hash_str(text: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
+/// How often the open file is checked for external modification.
+const FILE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+fn should_check_file(last: Option<Instant>, now: Instant, interval: Duration) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.duration_since(t) >= interval,
+    }
+}
+
+/// Newline and character counts, computed in a single pass over the bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TextStats {
+    newlines: usize,
+    chars: usize,
+}
+
+fn text_stats(text: &str) -> TextStats {
+    let mut newlines = 0usize;
+    let mut chars = 0usize;
+    for &b in text.as_bytes() {
+        newlines += (b == b'\n') as usize;
+        // Every byte that isn't a UTF-8 continuation byte starts a char.
+        chars += ((b & 0xC0) != 0x80) as usize;
+    }
+    TextStats { newlines, chars }
+}
+
+/// Values derived from the text, valid for one `text_rev`.
+#[derive(Clone, Copy, Debug)]
+struct DerivedText {
+    rev: u64,
+    dirty: bool,
+    stats: TextStats,
+}
+
+/// The last galley produced by the editor layouter. Reused while the text and
+/// layout inputs are unchanged, so idle frames skip re-highlighting entirely.
+struct LayoutCache {
+    text: String,
+    mode: HighlightMode,
+    font: egui::FontId,
+    wrap_bits: u32,
+    dark: bool,
+    ppp_bits: u32,
+    galley: Arc<egui::Galley>,
 }
 
 /// Cached match list for "highlight all", so it isn't recomputed every frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FindCacheKey {
-    text_hash: u64,
-    text_len: usize,
+    rev: u64,
     query: String,
     mode: FindMode,
     case_sensitive: bool,
@@ -326,6 +362,16 @@ struct ScratchpadApp {
     file_change_disabled: bool,
 
     find_cache: Option<FindCache>,
+
+    /// Bumped whenever `text` or `saved_snapshot` changes. Everything derived from
+    /// the text (dirty flag, counts, cursor position, find matches) is cached
+    /// against this instead of being recomputed every frame.
+    text_rev: u64,
+    derived: Cell<Option<DerivedText>>,
+    cursor_cache: Cell<Option<(u64, usize, (usize, usize))>>,
+    layout_cache: RefCell<Option<LayoutCache>>,
+
+    last_file_check: Option<Instant>,
 }
 
 impl Default for ScratchpadApp {
@@ -350,6 +396,11 @@ impl Default for ScratchpadApp {
             file_change_prompt_open: false,
             file_change_disabled: false,
             find_cache: None,
+            text_rev: 0,
+            derived: Cell::new(None),
+            cursor_cache: Cell::new(None),
+            layout_cache: RefCell::new(None),
+            last_file_check: None,
         }
     }
 }
@@ -371,7 +422,39 @@ impl ScratchpadApp {
 
     /// Are there unsaved edits?
     fn is_dirty(&self) -> bool {
-        self.text != self.saved_snapshot
+        self.derived().dirty
+    }
+
+    /// Record that `text` or `saved_snapshot` changed.
+    fn touch(&mut self) {
+        self.text_rev = self.text_rev.wrapping_add(1);
+    }
+
+    /// Derived text values, recomputed only when the text revision changed.
+    fn derived(&self) -> DerivedText {
+        if let Some(d) = self.derived.get() {
+            if d.rev == self.text_rev {
+                return d;
+            }
+        }
+        let d = DerivedText {
+            rev: self.text_rev,
+            dirty: self.text != self.saved_snapshot,
+            stats: text_stats(&self.text),
+        };
+        self.derived.set(Some(d));
+        d
+    }
+
+    fn cached_cursor_line_col(&self, char_idx: usize) -> (usize, usize) {
+        if let Some((rev, idx, result)) = self.cursor_cache.get() {
+            if rev == self.text_rev && idx == char_idx {
+                return result;
+            }
+        }
+        let result = cursor_line_col(&self.text, char_idx);
+        self.cursor_cache.set(Some((self.text_rev, char_idx, result)));
+        result
     }
 
     /// Show an error message in the UI.
@@ -403,6 +486,7 @@ impl ScratchpadApp {
     fn do_new_file(&mut self) {
         self.text.clear();
         self.saved_snapshot.clear();
+        self.touch();
         self.file_path = None;
         self.line_ending = LineEnding::Lf;
         self.last_file_mtime = None;
@@ -437,6 +521,7 @@ impl ScratchpadApp {
                 let (normalized, line_ending) = Self::normalize_line_endings(&contents);
                 self.text = normalized;
                 self.saved_snapshot = self.text.clone();
+                self.touch();
                 self.line_ending = line_ending;
                 self.push_recent(&path);
                 self.file_path = Some(path);
@@ -457,6 +542,7 @@ impl ScratchpadApp {
                 let (normalized, line_ending) = Self::normalize_line_endings(&contents);
                 self.text = normalized;
                 self.saved_snapshot = self.text.clone();
+                self.touch();
                 self.line_ending = line_ending;
                 self.push_recent(&path);
                 self.file_path = Some(path);
@@ -495,6 +581,7 @@ impl ScratchpadApp {
 
         // Only mark "clean" after a successful write.
         self.saved_snapshot = self.text.clone();
+        self.touch();
         self.last_file_mtime = Self::read_file_mtime(&self.file_path);
     }
 
@@ -521,6 +608,7 @@ impl ScratchpadApp {
 
         self.file_path = Some(path);
         self.saved_snapshot = self.text.clone();
+        self.touch();
         self.last_file_mtime = Self::read_file_mtime(&self.file_path);
     }
 
@@ -545,10 +633,21 @@ impl ScratchpadApp {
         fs::metadata(path).and_then(|m| m.modified()).ok()
     }
 
-    fn check_external_change(&mut self) {
+    fn check_external_change(&mut self, ctx: &egui::Context) {
         if self.file_change_disabled || !self.settings.watch_file_changes {
             return;
         }
+        if self.file_path.is_none() {
+            return;
+        }
+        // Wake an otherwise idle window periodically so external edits are noticed,
+        // but only touch the file system once per interval, not once per frame.
+        ctx.request_repaint_after(FILE_CHECK_INTERVAL);
+        let now = Instant::now();
+        if !should_check_file(self.last_file_check, now, FILE_CHECK_INTERVAL) {
+            return;
+        }
+        self.last_file_check = Some(now);
         let Some(path) = &self.file_path else {
             return;
         };
@@ -576,6 +675,7 @@ impl ScratchpadApp {
                 let (normalized, line_ending) = Self::normalize_line_endings(&contents);
                 self.text = normalized;
                 self.saved_snapshot = self.text.clone();
+                self.touch();
                 self.line_ending = line_ending;
                 self.last_file_mtime = Self::read_file_mtime(&self.file_path);
                 self.request_editor_focus = true;
@@ -664,16 +764,17 @@ impl ScratchpadApp {
 
         let dirty = if self.is_dirty() { "*" } else { "" };
 
-        let newlines = self.text.bytes().filter(|&b| b == b'\n').count();
+        let stats = self.derived().stats;
+        let newlines = stats.newlines;
         let lines = newlines + 1;
-        let chars = self.text.chars().count();
+        let chars = stats.chars;
 
         let mut line = 1usize;
         let mut col = 1usize;
         let mut selection_len = 0usize;
         if let Some(state) = egui::TextEdit::load_state(ctx, egui::Id::new("editor")) {
             if let Some(range) = state.cursor.char_range() {
-                (line, col) = cursor_line_col(&self.text, range.primary.index);
+                (line, col) = self.cached_cursor_line_col(range.primary.index);
                 let [min, max] = range.sorted();
                 selection_len = max.index.saturating_sub(min.index);
             }
@@ -719,24 +820,38 @@ impl ScratchpadApp {
         ctx.set_style(style);
     }
 
-    fn make_editor_layouter(
+    fn make_editor_layouter<'a>(
+        cache: &'a RefCell<Option<LayoutCache>>,
         wrap: bool,
         wrap_width: f32,
         font_id: egui::FontId,
         highlight_mode: HighlightMode,
-    ) -> impl FnMut(&egui::Ui, &str, f32) -> std::sync::Arc<egui::Galley> {
+    ) -> impl FnMut(&egui::Ui, &str, f32) -> Arc<egui::Galley> + 'a {
         move |ui, text, _wrap_width| {
             let max_width = if wrap { wrap_width } else { f32::INFINITY };
-            match highlight_mode {
+            let dark = ui.visuals().dark_mode;
+            let ppp_bits = ui.ctx().pixels_per_point().to_bits();
+
+            // The editor may lay out the text several times per frame (before and
+            // after an edit), so the cache is keyed on the full text, not a revision.
+            if let Some(c) = cache.borrow().as_ref() {
+                if c.mode == highlight_mode
+                    && c.font == font_id
+                    && c.wrap_bits == max_width.to_bits()
+                    && c.dark == dark
+                    && c.ppp_bits == ppp_bits
+                    && c.text == text
+                {
+                    return c.galley.clone();
+                }
+            }
+
+            let job = match highlight_mode {
                 HighlightMode::Markdown => {
-                    let job =
-                        Self::build_markdown_highlight_job(text, &font_id, max_width, ui.visuals());
-                    ui.fonts(|f| f.layout_job(job))
+                    Self::build_markdown_highlight_job(text, &font_id, max_width, ui.visuals())
                 }
                 HighlightMode::Syntax => {
-                    let job =
-                        Self::build_syntax_highlight_job(text, &font_id, max_width, ui.visuals());
-                    ui.fonts(|f| f.layout_job(job))
+                    Self::build_syntax_highlight_job(text, &font_id, max_width, ui.visuals())
                 }
                 HighlightMode::Off => {
                     let mut job = egui::text::LayoutJob::simple(
@@ -746,9 +861,20 @@ impl ScratchpadApp {
                         max_width,
                     );
                     job.wrap.max_width = max_width;
-                    ui.fonts(|f| f.layout_job(job))
+                    job
                 }
-            }
+            };
+            let galley = ui.fonts(|f| f.layout_job(job));
+            *cache.borrow_mut() = Some(LayoutCache {
+                text: text.to_owned(),
+                mode: highlight_mode,
+                font: font_id.clone(),
+                wrap_bits: max_width.to_bits(),
+                dark,
+                ppp_bits,
+                galley: galley.clone(),
+            });
+            galley
         }
     }
 
@@ -1206,6 +1332,7 @@ impl ScratchpadApp {
             self.find_state.mode == FindMode::Literal,
         );
         self.text.replace_range(m.start_byte..m.end_byte, &replacement);
+        self.touch();
         let new_end = m.start_char + replacement.chars().count();
         self.select_match(ctx, m.start_char, new_end);
         self.find_state.scroll_to_match = true;
@@ -1231,6 +1358,7 @@ impl ScratchpadApp {
             &self.find_state.replace,
             self.find_state.mode == FindMode::Literal,
         );
+        self.touch();
         self.request_editor_focus = true;
         self.set_find_result(format!("Replaced {}", matches.len()));
     }
@@ -1250,8 +1378,7 @@ impl ScratchpadApp {
 
         // Recompute matches only when the text or the search settings changed.
         let key = FindCacheKey {
-            text_hash: hash_str(&self.text),
-            text_len: self.text.len(),
+            rev: self.text_rev,
             query: self.find_state.query.clone(),
             mode: self.find_state.mode,
             case_sensitive: self.find_state.case_sensitive,
@@ -1334,6 +1461,14 @@ impl eframe::App for ScratchpadApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
+    }
+}
+
+impl ScratchpadApp {
+    /// One UI frame. Separate from `update` so it can be driven without an
+    /// `eframe::Frame` (see `bench.rs`).
+    fn frame(&mut self, ctx: &egui::Context) {
         self.apply_font_settings(ctx);
         self.poll_update_check();
         let mut open_find = false;
@@ -1358,7 +1493,7 @@ impl eframe::App for ScratchpadApp {
             self.populate_find_from_selection(ctx);
             self.find_state.request_focus = true;
         }
-        self.check_external_change();
+        self.check_external_change(ctx);
         let mut hotkey_new = false;
         let mut hotkey_open = false;
         let mut hotkey_save = false;
@@ -1867,7 +2002,7 @@ impl eframe::App for ScratchpadApp {
                 egui::FontId::new(self.settings.font_size, self.settings.font_family.to_egui());
             let line_number_color = ui.visuals().weak_text_color();
 
-            let total_lines = count_lines(&self.text);
+            let total_lines = self.derived().stats.newlines + 1;
             let highlight_mode = if self.text.len() > MAX_HIGHLIGHT_BYTES {
                 HighlightMode::Off
             } else {
@@ -1920,6 +2055,7 @@ impl eframe::App for ScratchpadApp {
                         }
 
                         let mut layouter = Self::make_editor_layouter(
+                            &self.layout_cache,
                             self.settings.word_wrap,
                             wrap_width,
                             font_id.clone(),
@@ -1939,6 +2075,13 @@ impl eframe::App for ScratchpadApp {
                                 |ui| text_edit.show(ui),
                             )
                             .inner;
+
+                        // Release the layouter's borrow of `layout_cache` before mutating self.
+                        drop(layouter);
+
+                        if output.response.changed() {
+                            self.touch();
+                        }
 
                         if self.find_state.scroll_to_match {
                             if let Some(cursor_range) = output.cursor_range.clone() {
@@ -2066,6 +2209,7 @@ impl eframe::App for ScratchpadApp {
                             if is_exit {
                                 // Revert so the close-request guard doesn't re-block the exit.
                                 self.text = self.saved_snapshot.clone();
+                                self.touch();
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             } else {
                                 // New/Open replace the buffer themselves on success; if the
@@ -2365,6 +2509,9 @@ fn format_size(bytes: usize) -> String {
 
 
 #[cfg(test)]
+mod bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2603,9 +2750,39 @@ mod tests {
     }
 
     #[test]
-    fn count_lines_counts_newlines() {
-        assert_eq!(count_lines(""), 1);
-        assert_eq!(count_lines("a\nb\n"), 3);
+    fn text_stats_counts_newlines_and_chars() {
+        assert_eq!(text_stats(""), TextStats { newlines: 0, chars: 0 });
+        assert_eq!(text_stats("a\nb\n"), TextStats { newlines: 2, chars: 4 });
+        let t = "héé\nü€😀";
+        assert_eq!(text_stats(t).chars, t.chars().count());
+        assert_eq!(text_stats(t).newlines, 1);
+    }
+
+    #[test]
+    fn file_check_is_throttled() {
+        let t0 = Instant::now();
+        let iv = Duration::from_secs(1);
+        assert!(should_check_file(None, t0, iv));
+        assert!(!should_check_file(Some(t0), t0 + Duration::from_millis(999), iv));
+        assert!(should_check_file(Some(t0), t0 + iv, iv));
+    }
+
+    #[test]
+    fn derived_values_follow_text_revision() {
+        let mut app = ScratchpadApp::default();
+        assert!(!app.is_dirty());
+        app.text = "hello\nworld".to_string();
+        app.touch();
+        assert!(app.is_dirty());
+        assert_eq!(app.derived().stats.newlines, 1);
+        app.saved_snapshot = app.text.clone();
+        app.touch();
+        assert!(!app.is_dirty());
+        // Cursor lookups are cached per (revision, index) and stay correct after edits.
+        assert_eq!(app.cached_cursor_line_col(8), (2, 3));
+        app.text.insert_str(0, "x\n");
+        app.touch();
+        assert_eq!(app.cached_cursor_line_col(8), (3, 1));
     }
 
     #[test]
