@@ -71,6 +71,25 @@ enum LineEnding {
     CrLf,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum ThemeSetting {
+    /// Follow the operating system.
+    #[default]
+    Auto,
+    Light,
+    Dark,
+}
+
+impl ThemeSetting {
+    fn preference(self) -> egui::ThemePreference {
+        match self {
+            ThemeSetting::Auto => egui::ThemePreference::System,
+            ThemeSetting::Light => egui::ThemePreference::Light,
+            ThemeSetting::Dark => egui::ThemePreference::Dark,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum HighlightMode {
     Off,
@@ -89,6 +108,7 @@ struct AppSettings {
     highlight_mode: HighlightMode,
     check_updates: bool,
     watch_file_changes: bool,
+    theme: ThemeSetting,
 }
 
 impl Default for AppSettings {
@@ -102,6 +122,7 @@ impl Default for AppSettings {
             highlight_mode: HighlightMode::Syntax,
             check_updates: true,
             watch_file_changes: true,
+            theme: ThemeSetting::Auto,
         }
     }
 }
@@ -276,6 +297,8 @@ struct FindState {
     highlight_all: bool,
     last_result: Option<String>,
     scroll_to_match: bool,
+    /// Char range of the match most recently selected by Find.
+    last_found: Option<(usize, usize)>,
     request_focus: bool,
 }
 
@@ -291,6 +314,7 @@ impl Default for FindState {
             highlight_all: false,
             last_result: None,
             scroll_to_match: false,
+            last_found: None,
             request_focus: false,
         }
     }
@@ -809,6 +833,10 @@ impl ScratchpadApp {
     }
 
     fn apply_font_settings(&self, ctx: &egui::Context) {
+        let pref = self.settings.theme.preference();
+        if ctx.options(|o| o.theme_preference) != pref {
+            ctx.set_theme(pref);
+        }
         // Called every frame, so bail out cheaply when nothing needs changing.
         if ctx.global_style().text_styles.values().all(|f| f.size == 14.0) {
             return;
@@ -1175,12 +1203,19 @@ impl ScratchpadApp {
 
     fn current_selection_char_range(&self, ctx: &egui::Context) -> Option<(usize, usize)> {
         let editor_id = egui::Id::unique("editor");
-        egui::TextEdit::load_state(ctx, editor_id)
+        let current = egui::TextEdit::load_state(ctx, editor_id)
             .and_then(|state| state.cursor.char_range())
             .map(|range| {
                 let [min, max] = range.sorted_cursors();
                 (usize::from(min.index), usize::from(max.index))
-            })
+            });
+        // When the editor loses focus (e.g. a Find button was clicked) egui collapses
+        // the selection to its end. Treat that as still selecting the last found match,
+        // otherwise Find Previous would just re-find the same match.
+        match (current, self.find_state.last_found) {
+            (Some((a, b)), Some(found)) if a == b && a == found.1 => Some(found),
+            (cur, _) => cur,
+        }
     }
 
     fn populate_find_from_selection(&mut self, ctx: &egui::Context) {
@@ -1199,6 +1234,7 @@ impl ScratchpadApp {
     }
 
     fn select_match(&mut self, ctx: &egui::Context, start_char: usize, end_char: usize) {
+        self.find_state.last_found = Some((start_char, end_char));
         let editor_id = egui::Id::unique("editor");
         if let Some(mut state) = egui::TextEdit::load_state(ctx, editor_id) {
             let range = egui::text::CCursorRange::two(
@@ -1415,7 +1451,12 @@ impl ScratchpadApp {
             .sum();
 
         let painter = ui.painter_at(output.text_clip_rect);
-        let color = ui.visuals().selection.bg_fill;
+        // Translucent so the text underneath stays readable in both themes.
+        let color = if ui.visuals().dark_mode {
+            egui::Color32::from_rgba_unmultiplied(255, 200, 40, 70)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(255, 190, 0, 90)
+        };
         for row in &rows[first_row..end_row] {
             let row_end = row_start + usize::from(row.char_count_excluding_newline());
             let next_start = row_start + usize::from(row.char_count_including_newline());
@@ -1729,6 +1770,17 @@ impl ScratchpadApp {
                         .changed();
                     changed |= ui
                         .checkbox(&mut self.settings.word_wrap, "Word wrap")
+                        .changed();
+                    ui.separator();
+                    ui.label("Theme");
+                    changed |= ui
+                        .radio_value(&mut self.settings.theme, ThemeSetting::Auto, "Auto")
+                        .changed();
+                    changed |= ui
+                        .radio_value(&mut self.settings.theme, ThemeSetting::Light, "Light")
+                        .changed();
+                    changed |= ui
+                        .radio_value(&mut self.settings.theme, ThemeSetting::Dark, "Dark")
                         .changed();
                     ui.separator();
                     ui.label("Highlighting");
@@ -2093,7 +2145,14 @@ impl ScratchpadApp {
                         }
 
                         if self.find_state.scroll_to_match {
-                            if let Some(cursor_range) = output.cursor_range.clone() {
+                            // The editor only reports its cursor on frames where it has
+                            // focus, which arrives a frame after the Find click, so fall
+                            // back to the stored state.
+                            let cursor_range = output.cursor_range.or_else(|| {
+                                egui::TextEdit::load_state(ui.ctx(), editor_id)
+                                    .and_then(|st| st.cursor.range(&output.galley))
+                            });
+                            if let Some(cursor_range) = cursor_range {
                                 let row_height = output
                                     .galley
                                     .rows
@@ -2109,6 +2168,7 @@ impl ScratchpadApp {
                                 ui.scroll_to_rect(cursor_rect, None);
                             }
                             self.find_state.scroll_to_match = false;
+                            ui.ctx().request_repaint();
                         }
 
                         if show_line_numbers {

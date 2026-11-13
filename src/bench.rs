@@ -96,3 +96,26 @@ fn bench_large_document_frames() {
     // Below MAX_HIGHLIGHT_BYTES, so the syntax highlighter is active.
     run_scenarios("medium (syntax highlighting)", 1024 * 1024);
 }
+
+#[test]
+fn find_previous_walks_backwards() {
+    let mut h = Harness::new("aa x aa x aa x aa\n".repeat(3));
+    h.app.find_state.query = "x".to_string();
+    let ctx = h.ctx.clone();
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let mut seq = vec![];
+    for step in ["n", "n", "n", "p", "p", "p"] {
+        if step == "n" { h.app.find_next(&ctx) } else { h.app.find_previous(&ctx) }
+        h.frame(vec![]);
+        h.frame(vec![]);
+        // Simulate the editor losing focus (user clicked a button / the find field).
+        ctx.memory_mut(|m| m.request_focus(egui::Id::unique("find_input")));
+        h.frame(vec![]);
+        h.frame(vec![]);
+        seq.push(h.app.current_selection_char_range(&ctx));
+    }
+    println!("{seq:?}");
+    assert_eq!(seq[3], seq[1]);
+    assert_eq!(seq[4], seq[0]);
+}
