@@ -119,3 +119,43 @@ fn find_previous_walks_backwards() {
     assert_eq!(seq[3], seq[1]);
     assert_eq!(seq[4], seq[0]);
 }
+
+/// Working-set size of this process in MiB (Windows `tasklist`).
+fn working_set_mib() -> f64 {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", std::process::id()), "/FO", "CSV", "/NH"])
+        .output()
+        .expect("tasklist");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let field = s.trim().rsplit("\",\"").next().unwrap_or("");
+    let digits: String = field.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.parse::<f64>().unwrap_or(0.0) / 1024.0
+}
+
+/// Measures how process memory grows with each undo point. Each undo point holds a
+/// full copy of the text, so memory should grow by ~document size per edit.
+/// Run: `cargo test --release bench_undo -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_undo_memory() {
+    let size = std::env::var("BENCH_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(10 * 1024 * 1024);
+    let mut h = Harness::new(make_text(size));
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let base = working_set_mib();
+    println!("doc {:.1} MiB, baseline working set {base:.0} MiB", size as f64 / 1048576.0);
+    let mut t = 0.0;
+    for n in 1..=40 {
+        // One edit, then let the text sit for >1 s so the undoer records a point.
+        t += 1.5;
+        h.start = Instant::now() - std::time::Duration::from_secs_f64(t);
+        h.frame(vec![egui::Event::Text("x".to_string())]);
+        t += 1.5;
+        h.start = Instant::now() - std::time::Duration::from_secs_f64(t);
+        h.frame(vec![]);
+        if n % 10 == 0 {
+            let ws = working_set_mib();
+            println!("after {n:>3} undo points: {ws:>7.0} MiB (+{:.0})", ws - base);
+        }
+    }
+}

@@ -1523,9 +1523,16 @@ impl ScratchpadApp {
         self.poll_update_check();
         let mut open_find = false;
         let mut open_replace = false;
+        let mut hotkey_find_next = false;
+        let mut hotkey_find_prev = false;
         ctx.input_mut(|i| {
             if i.consume_key(egui::Modifiers::COMMAND, egui::Key::F) {
                 open_find = true;
+            }
+            if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F3) {
+                hotkey_find_prev = true;
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F3) {
+                hotkey_find_next = true;
             }
             if i.consume_key(egui::Modifiers::COMMAND, egui::Key::R) {
                 open_replace = true;
@@ -1542,6 +1549,17 @@ impl ScratchpadApp {
             self.find_state.show_replace = true;
             self.populate_find_from_selection(ctx);
             self.find_state.request_focus = true;
+        }
+        if hotkey_find_next || hotkey_find_prev {
+            if self.find_state.query.is_empty() {
+                // Nothing to search for yet: open the dialog instead.
+                self.find_state.open = true;
+                self.find_state.request_focus = true;
+            } else if hotkey_find_prev {
+                self.find_previous(ctx);
+            } else {
+                self.find_next(ctx);
+            }
         }
         self.check_external_change(ctx);
         let mut hotkey_new = false;
@@ -1966,6 +1984,20 @@ impl ScratchpadApp {
                             self.find_state.request_focus = false;
                         }
                         find_changed |= find_response.changed();
+                        // Enter in the box finds next, Shift+Enter finds previous; keep
+                        // the focus in the box so the user can keep pressing Enter.
+                        if find_response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            && !self.find_state.query.is_empty()
+                        {
+                            if ui.input(|i| i.modifiers.shift) {
+                                self.find_previous(ctx);
+                            } else {
+                                self.find_next(ctx);
+                            }
+                            self.request_editor_focus = false;
+                            find_response.request_focus();
+                        }
                     });
 
                     if self.find_state.show_replace {
