@@ -159,3 +159,34 @@ fn bench_undo_memory() {
         }
     }
 }
+
+fn undo_count(h: &Harness) -> usize {
+    let st = egui::TextEdit::load_state(&h.ctx, egui::Id::unique("editor")).unwrap();
+    let dbg = format!("{:?}", st.undoer());
+    dbg.split("undo count: ").nth(1).unwrap().split(',').next().unwrap().trim().parse().unwrap()
+}
+
+fn type_with_pauses(h: &mut Harness, n: usize) {
+    let mut t = 0.0;
+    for _ in 0..n {
+        t += 1.5;
+        h.start = Instant::now() - std::time::Duration::from_secs_f64(t);
+        h.frame(vec![egui::Event::Text("x".to_string())]);
+        t += 1.5;
+        h.start = Instant::now() - std::time::Duration::from_secs_f64(t);
+        h.frame(vec![]);
+    }
+}
+
+#[test]
+fn undo_history_is_capped_for_large_documents() {
+    let mut big = Harness::new(make_text(LARGE_DOC_UNDO_BYTES + 1024));
+    big.frame(vec![]);
+    type_with_pauses(&mut big, 30);
+    assert!(undo_count(&big) <= LARGE_DOC_MAX_UNDOS, "big doc kept {}", undo_count(&big));
+
+    let mut small = Harness::new(make_text(10 * 1024));
+    small.frame(vec![]);
+    type_with_pauses(&mut small, 30);
+    assert!(undo_count(&small) > LARGE_DOC_MAX_UNDOS, "small doc kept {}", undo_count(&small));
+}

@@ -127,6 +127,14 @@ impl Default for AppSettings {
     }
 }
 
+/// Above this size the editor keeps far fewer undo points. egui stores a full copy of
+/// the text per undo point (up to 100 by default), which would cost gigabytes.
+const LARGE_DOC_UNDO_BYTES: usize = 1024 * 1024;
+/// Above this size the status bar warns that editing will be slow and memory-hungry.
+const HUGE_DOC_BYTES: usize = 5 * 1024 * 1024;
+const LARGE_DOC_MAX_UNDOS: usize = 10;
+const DEFAULT_MAX_UNDOS: usize = 100;
+
 /// Above this size the highlighter is skipped (it is O(n) work per edit).
 const MAX_HIGHLIGHT_BYTES: usize = 2 * 1024 * 1024;
 
@@ -367,6 +375,9 @@ struct ScratchpadApp {
     /// Clear editor selection/state on the next frame (after New/Open).
     reset_editor_state: bool,
 
+    /// Whether the editor's undo history is currently limited for a large document.
+    undo_capped: bool,
+
     /// Show last error in a small status bar.
     last_error: Option<String>,
 
@@ -409,6 +420,7 @@ impl Default for ScratchpadApp {
             pending_action: None,
             request_editor_focus: true,
             reset_editor_state: false,
+            undo_capped: false,
             last_error: None,
             settings: AppSettings::default(),
             find_state: FindState::default(),
@@ -820,6 +832,12 @@ impl ScratchpadApp {
             String::new()
         };
 
+        let huge_text = if self.text.len() > HUGE_DOC_BYTES {
+            "  |  Large file: editing may be slow and use a lot of memory"
+        } else {
+            ""
+        };
+
         let update_text = if let Some(version) = &self.update_available {
             format!("  |  New Version Available: v{version}")
         } else {
@@ -829,7 +847,26 @@ impl ScratchpadApp {
         format!(
             "{name}{dirty}  |  Ln {line}, Col {col}  |  Lines: {lines}  Chars: {chars}  |  Size: {size_text}  |  {line_ending}{selection_text}"
         )
+        + huge_text
         + &update_text
+    }
+
+    /// Limit the editor's undo history while the document is large (see
+    /// `LARGE_DOC_UNDO_BYTES`). Switching the limit restarts the history.
+    fn update_undo_limit(&mut self, ctx: &egui::Context, editor_id: egui::Id) {
+        let large = self.text.len() > LARGE_DOC_UNDO_BYTES;
+        if large == self.undo_capped {
+            return;
+        }
+        let mut state = egui::TextEdit::load_state(ctx, editor_id).unwrap_or_default();
+        state.set_undoer(egui::util::undoer::Undoer::with_settings(
+            egui::util::undoer::Settings {
+                max_undos: if large { LARGE_DOC_MAX_UNDOS } else { DEFAULT_MAX_UNDOS },
+                ..Default::default()
+            },
+        ));
+        state.store(ctx, editor_id);
+        self.undo_capped = large;
     }
 
     fn apply_font_settings(&self, ctx: &egui::Context) {
@@ -2088,7 +2125,9 @@ impl ScratchpadApp {
             if self.reset_editor_state {
                 egui::TextEdit::store_state(ctx, editor_id, Default::default());
                 self.reset_editor_state = false;
+                self.undo_capped = false;
             }
+            self.update_undo_limit(ctx, editor_id);
             let show_line_numbers = self.settings.show_line_numbers;
 
             let font_id =
